@@ -74,7 +74,7 @@ receiver before treating remote logging as operational.
 
 Run these commands as root on a Proxmox host. Adjust every value in the first
 block. The repository checkout must contain commit
-`6f5473e3aaf4ebf489965f4a3ae15db49af6dc47`.
+`89e5b0f6bd4843ec13279d710ef677c1ad488be8`.
 
 The example retains the existing trust model: `admin` has passwordless sudo,
 Docker profiles add `admin` to the Docker group, and Proxmox firewall
@@ -106,7 +106,7 @@ MEM_MAX=4096
 APPDATA_DISK_SIZE=16
 
 # Reviewed, immutable inputs
-CLOUD_INIT_REF=6f5473e3aaf4ebf489965f4a3ae15db49af6dc47
+CLOUD_INIT_REF=89e5b0f6bd4843ec13279d710ef677c1ad488be8
 IMAGE_BUILD=20260722-2547
 IMAGE_NAME=debian-13-genericcloud-amd64-${IMAGE_BUILD}.qcow2
 IMAGE_SHA512=735d1b2d0ef265a0c2323fdaa7d46e7bd7a1b984f73e8a785e638034bf07876e26374a9d809d713501270c071b3464d2ada0c5589f07742b95ed853cc6d48f45
@@ -118,7 +118,7 @@ case "$PROFILE" in
     PROFILE_SHA256=0063162b93792f0a556369057066477493980b643fee9c0656e6c7cce3ba55d3
     ;;
   deb_13_plain_syslog.yml)
-    PROFILE_SHA256=90aa612019cb1856929c670ca981015d90b75aea46b19f32139fc1fd29d8ed52
+    PROFILE_SHA256=b681821a6424f8879fc74181a9c1582b91330f910cee895644a5bcb92720227d
     NEEDS_SYSLOG=1
     ;;
   deb_13_docker.yml)
@@ -126,7 +126,7 @@ case "$PROFILE" in
     NEEDS_APPDATA=1
     ;;
   deb_13_docker_syslog.yml)
-    PROFILE_SHA256=76a8df118e50bbbfe37b96d825a41a5716ab86fabe06446ce9d42ccaa2b89173
+    PROFILE_SHA256=e75271a82b0d2f4cd0ae39b7c9e2cd9a789524a88deb4aee0631e76f972eb65b
     NEEDS_APPDATA=1
     NEEDS_SYSLOG=1
     ;;
