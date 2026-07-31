@@ -297,6 +297,21 @@ def main() -> int:
             validate_docker(files, profile.output)
             if "mounts" not in config or "bootcmd" not in config:
                 raise SystemExit(f"{profile.output}: APPDATA provisioning is missing")
+            expected_mount = [
+                "LABEL=APPDATA",
+                "/mnt/appdata",
+                "ext4",
+                (
+                    "defaults,noatime,x-systemd.growfs,nodev,"
+                    "x-systemd.device-timeout=30s"
+                ),
+                "0",
+                "2",
+            ]
+            if config["mounts"] != [expected_mount]:
+                raise SystemExit(
+                    f"{profile.output}: cloud-init must own exactly one APPDATA mount"
+                )
             boot_script = "\n".join(
                 command
                 for command in config["bootcmd"]
@@ -310,9 +325,26 @@ def main() -> int:
                 raise SystemExit(f"{profile.output}: destructive disk guards are missing")
             if 'app_serial" = APPDATA' not in boot_script:
                 raise SystemExit(f"{profile.output}: APPDATA serial guard is missing")
+            if re.search(
+                r"(?m)^\s*(?:/usr/bin/|/bin/)?mount(?:\s|$)",
+                boot_script,
+            ):
+                raise SystemExit(
+                    f"{profile.output}: bootcmd must not mount APPDATA; use mounts"
+                )
             mount_options = config["mounts"][0][3]
             if "nofail" in mount_options or "x-systemd.device-timeout=30s" not in mount_options:
                 raise SystemExit(f"{profile.output}: APPDATA mount is not fail-closed")
+            finalizer = files["/usr/local/sbin/cloud-init-finalize"]
+            require_fragments(
+                finalizer,
+                (
+                    'findmnt -rn --mountpoint /mnt/appdata -o TARGET | wc -l',
+                    '[ "$app_mount_count" -eq 1 ]',
+                    "APPDATA must be mounted exactly once",
+                ),
+                profile.output,
+            )
         elif "mounts" in config or "bootcmd" in config:
             raise SystemExit(f"{profile.output}: plain profiles must not format APPDATA")
 

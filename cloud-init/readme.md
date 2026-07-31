@@ -45,7 +45,9 @@ Docker profiles require one dedicated, whole, unpartitioned data disk with:
 The bootstrap refuses to format a disk unless all of those checks pass. It
 also rejects the root device chain, partitioned devices, and disks containing
 unknown signatures. `/mnt/appdata` is a required mount; Docker cannot start
-without it.
+without it. The cloud-init `mounts` module is its sole mount owner; `bootcmd`
+only validates or creates the filesystem, and final validation requires exactly
+one mount at `/mnt/appdata`.
 
 Do not attach that WWN and serial to any other disk in the same VM.
 
@@ -264,6 +266,12 @@ sudo less /home/admin/logs/cloud-init-errors.log
 sudo less /home/admin/logs/cloud-init-full.log
 ```
 
+For Docker profiles, verify that APPDATA has exactly one kernel mount:
+
+```bash
+test "$(findmnt -rn --mountpoint /mnt/appdata -o TARGET | wc -l)" -eq 1
+```
+
 Ongoing unattended upgrades are security-only and never reboot
 automatically. Schedule full OS upgrades, Docker upgrades, image pruning, and
 required reboots through your normal maintenance or configuration-management
@@ -281,5 +289,6 @@ cloud-init/tools/validate.sh
 
 Validation covers cloud-init schema, YAML lint, embedded shell scripts, Docker
 daemon JSON, the pinned Docker signing-key fingerprint, rsyslog syntax, SSH
-baseline consistency, APPDATA destructive-operation guards, success gating,
-and generated-file drift. CI runs the same validation in Debian 13.
+baseline consistency, APPDATA destructive-operation and single-mount guards,
+success gating, and generated-file drift. CI runs the same validation in
+Debian 13.

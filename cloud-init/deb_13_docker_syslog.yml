@@ -21,6 +21,8 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: true
 
+# The cloud-init mounts module is the sole owner of this mount. bootcmd only
+# validates or creates the filesystem so the same target cannot be mounted twice.
 mounts:
   - [LABEL=APPDATA, /mnt/appdata, ext4, "defaults,noatime,x-systemd.growfs,nodev,x-systemd.device-timeout=30s", "0", "2"]
 
@@ -455,8 +457,17 @@ write_files:
       systemctl is-active --quiet ssh.service
       systemctl enable --now fstrim.timer
 
-      mountpoint -q /mnt/appdata
-      app_source="$(findmnt -n -o SOURCE --target /mnt/appdata)"
+      mountpoint -q /mnt/appdata || {
+        echo "APPDATA is not mounted at /mnt/appdata" >&2
+        exit 1
+      }
+      app_mount_count="$(findmnt -rn --mountpoint /mnt/appdata -o TARGET | wc -l)"
+      [ "$app_mount_count" -eq 1 ] || {
+        echo "APPDATA must be mounted exactly once; found $app_mount_count mounts" >&2
+        findmnt -rn --mountpoint /mnt/appdata -o TARGET,SOURCE,FSTYPE,OPTIONS >&2 || true
+        exit 1
+      }
+      app_source="$(findmnt -rn --mountpoint /mnt/appdata -o SOURCE)"
       [ "$(blkid -s LABEL -o value "$app_source")" = APPDATA ]
       [ "$(blkid -s TYPE -o value "$app_source")" = ext4 ]
 
