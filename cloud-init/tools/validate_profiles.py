@@ -321,7 +321,11 @@ def main() -> int:
                 raise SystemExit(f"{profile.output}: deterministic APPDATA ID is missing")
             if "scsi-3" in boot_script or "head -n1" in boot_script:
                 raise SystemExit(f"{profile.output}: broad disk discovery is forbidden")
-            if "app_signatures" not in boot_script or "app_children" not in boot_script:
+            if (
+                "app_signatures" not in boot_script
+                or "app_children" not in boot_script
+                or "wipefs -n --noheadings --output TYPE" not in boot_script
+            ):
                 raise SystemExit(f"{profile.output}: destructive disk guards are missing")
             if 'app_serial" = APPDATA' not in boot_script:
                 raise SystemExit(f"{profile.output}: APPDATA serial guard is missing")

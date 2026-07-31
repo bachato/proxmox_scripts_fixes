@@ -81,7 +81,7 @@ bootcmd:
     }
 
     if [ -z "$app_fstype" ]; then
-      app_signatures="$(wipefs -n --noheadings -o TYPE "$app_dev")" || {
+      app_signatures="$(wipefs -n --noheadings --output TYPE "$app_dev")" || {
         echo "Could not inspect APPDATA signatures: $app_dev" >&2
         exit 1
       }
