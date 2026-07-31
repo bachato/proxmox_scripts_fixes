@@ -315,25 +315,19 @@ write_files:
       RateLimitIntervalSec=30s
       RateLimitBurst=5000
 
-  # Replace every logs.example.invalid occurrence with the receiver's certificate name.
-  - path: /etc/rsyslog.d/01-remote-tls.conf
+  # Replace logs.example.invalid with the receiver's IP address or DNS name.
+  - path: /etc/rsyslog.d/01-remote.conf
     owner: root:root
     permissions: "0644"
     content: |
-      global(
-        DefaultNetstreamDriverCAFile="/etc/ssl/certs/ca-certificates.crt"
-      )
       module(load="imjournal" StateFile="imjournal.state")
 
       action(
         type="omfwd"
         target="logs.example.invalid"
-        port="6514"
+        port="5140"
         protocol="tcp"
-        StreamDriver="ossl"
-        StreamDriverMode="1"
-        StreamDriverAuthMode="x509/name"
-        StreamDriverPermittedPeers="logs.example.invalid"
+        TCP_Framing="traditional"
         template="RSYSLOG_SyslogProtocol23Format"
         action.resumeRetryCount="-1"
         action.resumeInterval="30"
@@ -478,9 +472,8 @@ write_files:
       systemctl is-active --quiet docker.service
       timeout 30 docker info >/dev/null
 
-      update-ca-certificates
-      if grep -q "logs.example.invalid" /etc/rsyslog.d/01-remote-tls.conf; then
-        echo "Replace logs.example.invalid with the remote syslog certificate name" >&2
+      if grep -q "logs.example.invalid" /etc/rsyslog.d/01-remote.conf; then
+        echo "Replace logs.example.invalid with the remote syslog address" >&2
         exit 1
       fi
 
@@ -521,7 +514,6 @@ packages:
   - docker-ce-cli
   - docker-compose-plugin
   - rsyslog
-  - rsyslog-openssl
 
 growpart:
   mode: auto

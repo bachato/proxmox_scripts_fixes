@@ -165,19 +165,32 @@ def validate_docker(files: dict[str, str], profile_name: str) -> None:
 
 
 def validate_rsyslog(files: dict[str, str], profile_name: str) -> None:
-    config = files["/etc/rsyslog.d/01-remote-tls.conf"]
+    config = files["/etc/rsyslog.d/01-remote.conf"]
     require_fragments(
         config,
         (
-            'StreamDriver="ossl"',
-            'StreamDriverMode="1"',
-            'StreamDriverAuthMode="x509/name"',
+            'target="logs.example.invalid"',
+            'port="5140"',
+            'protocol="tcp"',
+            'TCP_Framing="traditional"',
             'queue.filename="syslog-forward"',
             'queue.maxDiskSpace="256m"',
             "\nstop\n",
         ),
         profile_name,
     )
+    forbidden_tls = (
+        "DefaultNetstreamDriverCAFile",
+        "StreamDriver",
+        "x509/",
+        "ossl",
+        "gtls",
+    )
+    present_tls = [fragment for fragment in forbidden_tls if fragment in config]
+    if present_tls:
+        raise SystemExit(
+            f"{profile_name}: plain TCP syslog contains TLS settings: {present_tls}"
+        )
 
     print(f"rsyslogd -N1 {profile_name}")
     run(
@@ -195,6 +208,10 @@ def validate_readme() -> None:
         "docker_graylog.yml",
         "ssh_authorized_keys:",
         "/home/logs",
+        "SYSLOG_CA_FILE",
+        "server-authenticated TLS",
+        "receiver certificate",
+        "rsyslog-openssl",
     ):
         if stale_text in content:
             raise SystemExit(f"readme.md: stale instruction remains: {stale_text}")
@@ -354,17 +371,25 @@ def main() -> int:
 
         if profile.syslog:
             validate_rsyslog(files, profile.output)
+            if "rsyslog-openssl" in config.get("packages", []):
+                raise SystemExit(
+                    f"{profile.output}: plain TCP syslog must not install TLS support"
+                )
             finalizer = files["/usr/local/sbin/cloud-init-finalize"]
             require_fragments(
                 finalizer,
                 (
                     'grep -q "logs.example.invalid"',
-                    "update-ca-certificates",
+                    "/etc/rsyslog.d/01-remote.conf",
                     "install -d -m 0700 -o root -g root /var/spool/rsyslog",
                     "/usr/sbin/rsyslogd -N1",
                 ),
                 profile.output,
             )
+            if "update-ca-certificates" in finalizer:
+                raise SystemExit(
+                    f"{profile.output}: plain TCP finalizer contains TLS setup"
+                )
         elif any(path.startswith("/etc/rsyslog") for path in files):
             raise SystemExit(f"{profile.output}: unexpected rsyslog configuration")
 

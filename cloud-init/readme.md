@@ -9,9 +9,9 @@ and run once on a clone's first boot.
 | Profile | Docker | Remote syslog | APPDATA disk |
 | --- | --- | --- | --- |
 | `deb_13_plain.yml` | No | No | No |
-| `deb_13_plain_syslog.yml` | No | TLS | No |
+| `deb_13_plain_syslog.yml` | No | Plain TCP | No |
 | `deb_13_docker.yml` | Yes | No | Required |
-| `deb_13_docker_syslog.yml` | Yes | TLS | Required |
+| `deb_13_docker_syslog.yml` | Yes | Plain TCP | Required |
 
 Files under `archive/` are historical references, not supported deployment
 profiles.
@@ -53,19 +53,13 @@ Do not attach that WWN and serial to any other disk in the same VM.
 
 ## Remote syslog behavior
 
-The syslog profiles send RFC 5424 logs over server-authenticated TLS on TCP
-port 6514. Before first boot, replace both occurrences of
-`logs.example.invalid` with the DNS name in the receiver certificate.
-Bootstrap fails while the placeholder remains.
+The syslog profiles send RFC 5424 logs over unencrypted TCP on port 5140.
+Before first boot, replace `logs.example.invalid` with the receiver's IP
+address or DNS name. Bootstrap fails while the placeholder remains.
 
-The receiver's issuing CA must be trusted:
-
-- Public CA: leave `SYSLOG_CA_FILE` empty in the provisioning block.
-- Private CA: set `SYSLOG_CA_FILE` to the issuing CA's PEM certificate.
-
-The provisioning block adds a private CA through cloud-init's `ca_certs`
-module, and the finalizer runs `update-ca-certificates` before validating
-rsyslog.
+Plain TCP provides no confidentiality, peer authentication, or tamper
+protection. Use these profiles only across a trusted network or a separately
+protected tunnel.
 
 These profiles intentionally do not claim that logging is memory-only.
 Journald uses up to 64 MiB of volatile storage, Debian's default local rsyslog
@@ -103,8 +97,7 @@ VM_STORAGE_NAME=local-zfs
 BRIDGE=vmbr100
 
 # Required only for a syslog profile
-SYSLOG_SERVER_NAME=
-SYSLOG_CA_FILE=
+SYSLOG_SERVER=
 
 # Optional sizing
 CPU=4
@@ -160,25 +153,16 @@ printf '%s  %s\n' "$PROFILE_SHA256" "$SNIPPET_PATH" | sha256sum --check -
 
 # Apply deterministic syslog customization after verifying the source profile.
 if [ "$NEEDS_SYSLOG" -eq 1 ]; then
-  case "$SYSLOG_SERVER_NAME" in
+  case "$SYSLOG_SERVER" in
     ""|*[!A-Za-z0-9.-]*)
-      echo "Set SYSLOG_SERVER_NAME to the receiver certificate's DNS name." >&2
+      echo "Set SYSLOG_SERVER to the receiver IP address or DNS name." >&2
       exit 1
       ;;
   esac
 
   sed -i \
-    "s/logs\\.example\\.invalid/${SYSLOG_SERVER_NAME}/g" \
+    "s/logs\\.example\\.invalid/${SYSLOG_SERVER}/g" \
     "$SNIPPET_PATH"
-
-  if [ -n "$SYSLOG_CA_FILE" ]; then
-    test -r "$SYSLOG_CA_FILE"
-    openssl x509 -in "$SYSLOG_CA_FILE" -noout -subject -issuer
-    {
-      printf '\nca_certs:\n  trusted:\n    - |\n'
-      sed 's/^/        /' "$SYSLOG_CA_FILE"
-    } >>"$SNIPPET_PATH"
-  fi
 fi
 
 # Download and verify the reviewed Debian cloud image.
