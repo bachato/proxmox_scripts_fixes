@@ -1,278 +1,129 @@
-# Debian 13 cloud-init profiles for Proxmox
+# Debian 13 cloud-init templates for Proxmox
 
-These profiles create a hardened Debian 13 VM, optionally with Docker and/or
-remote syslog. They are intended to be attached as Proxmox custom vendor data
-and run once on a clone's first boot.
+## What this repo does
 
-## Supported profiles
+This is my workflow for building VM's using cloud-init, fully configured and ready to go in 2 mintues!
 
-| Profile | Docker | Remote syslog | APPDATA disk |
+The files in this directory help you bild four hardened Debian 13 templates for Proxmox. Each
+template creates an `admin` user with your SSH key, disables password and root
+SSH login, and installs security updates and the QEMU guest agent.
+
+| Template | Docker | Remote syslog | APPDATA disk |
 | --- | --- | --- | --- |
-| `deb_13_plain.yml` | No | No | No |
-| `deb_13_plain_syslog.yml` | No | Plain TCP | No |
-| `deb_13_docker.yml` | Yes | No | Required |
-| `deb_13_docker_syslog.yml` | Yes | Plain TCP | Required |
+| Plain | No | No | No |
+| Plain + syslog | No | Plain TCP | No |
+| Docker | Yes | No | Yes |
+| Docker + syslog | Yes | Plain TCP | Yes |
 
-Files under `archive/` are historical references, not supported deployment
-profiles.
+Docker variants add a dedicated APPDATA disk.
+Syslog variants send logs over unencrypted TCP, so use them only on a trusted or separately protected network.  (TLS in the future)
 
-All supported profiles:
+## Basic logic of the repo
 
-- create the `admin` user and require a valid SSH public key supplied by
-  Proxmox;
-- disable root and password SSH login, install fail2ban, and validate sshd
-  before declaring success;
-- apply the kernel hardening and zram settings during bootstrap;
-- install and verify the QEMU guest agent, unattended-upgrades, fail2ban, and
-  zram swap;
-- perform a full package upgrade during image bootstrap, then configure
-  security-only unattended upgrades without automatic reboot;
-- write final diagnostic logs to `/home/admin/logs/`; and
-- power off only after every final validation succeeds.
+| Path | Purpose |
+| --- | --- |
+| `tools/.env` | Your local settings, copied from `tools/.env.example` and ignored by Git. Create this! |
+| `templates/` | Shared cloud-init, Proxmox user-data, and creation-script templates. You don't need to access. |
+| `tools/render_profiles.py` | Renders the template variations. You don't need to access |
+| `tools/build_template_bundle.py` | Validates the inputs and builds the Proxmox files. You don't need to access |
+| `tools/create_proxmox_template.sh` | Main build command.  Run this to build the templates! |
+| `build/` | Generated YAML and Proxmox creation scripts; ignored by Git. This is where your generated cloud-init files will live. |
+| `assets/` and `docs/` | Docker signing-key material and supporting notes. |
 
-If bootstrap fails, the VM deliberately remains running. Use its console and
-the cloud-init logs to diagnose the failure.
+The builder reads `.env`, renders all four templates, and writes the finished
+bundle to `ARTIFACT_OUTPUT_DIR` (`./cloud-init/build` by default).
 
-## Docker APPDATA safety contract
+## Create the cloud-init templates
 
-Docker profiles require one dedicated, whole, unpartitioned data disk with:
+Run these commands from the repository root on a Linux build machine. The
+validator requires only Python 3 with PyYAML and Bash. Building also requires
+OpenSSH's `ssh-keygen`. Proxmox tools and root access are not required on the
+build machine.
 
-- WWN `0x2000000000000001`;
-- serial `APPDATA`; and
-- either no existing signatures or an existing ext4 filesystem labeled
-  `APPDATA`.
-
-The bootstrap refuses to format a disk unless all of those checks pass. It
-also rejects the root device chain, partitioned devices, and disks containing
-unknown signatures. `/mnt/appdata` is a required mount; Docker cannot start
-without it. The cloud-init `mounts` module is its sole mount owner; `bootcmd`
-only validates or creates the filesystem, and final validation requires exactly
-one mount at `/mnt/appdata`.
-
-Do not attach that WWN and serial to any other disk in the same VM.
-
-## Remote syslog behavior
-
-The syslog profiles send RFC 5424 logs over unencrypted TCP on port 5140.
-Before first boot, replace `logs.example.invalid` with the receiver's IP
-address or DNS name. Bootstrap fails while the placeholder remains.
-
-Plain TCP provides no confidentiality, peer authentication, or tamper
-protection. Use these profiles only across a trusted network or a separately
-protected tunnel.
-
-These profiles intentionally do not claim that logging is memory-only.
-Journald uses up to 64 MiB of volatile storage, Debian's default local rsyslog
-file actions are bypassed, and rsyslog has a root-only disk-assisted queue
-bounded to 256 MiB for receiver outages. Cloud-init bootstrap logs and the
-final diagnostic copies remain persistent.
-
-The smoke-test message is tagged `cloud-init`. Confirm that it arrives at the
-receiver before treating remote logging as operational.
-
-## Create a Proxmox template
-
-Run these commands as root on a Proxmox host. Adjust every value in the first
-block. The repository checkout must contain commit
-`89e5b0f6bd4843ec13279d710ef677c1ad488be8`.
-
-The example retains the existing trust model: `admin` has passwordless sudo,
-Docker profiles add `admin` to the Docker group, and Proxmox firewall
-enforcement still depends on the host's firewall rules.
+Copy and edit the .env configuration file:
 
 ```bash
-set -euo pipefail
-
-# Required configuration
-VMID=9000
-NAME=debian13-template
-PROFILE=deb_13_docker.yml
-SSH_PUBLIC_KEY_FILE=/root/.ssh/id_ed25519.pub
-REPO_ROOT=/root/proxmox_scripts_fixes
-
-SNIPPET_STORAGE_NAME=local
-SNIPPET_STORAGE_PATH=/var/lib/vz/snippets
-ISO_STORAGE_PATH=/var/lib/vz/template/iso
-VM_STORAGE_NAME=local-zfs
-BRIDGE=vmbr100
-
-# Required only for a syslog profile
-SYSLOG_SERVER=
-
-# Optional sizing
-CPU=4
-MEM_MIN=1024
-MEM_MAX=4096
-APPDATA_DISK_SIZE=16
-
-# Reviewed, immutable inputs
-CLOUD_INIT_REF=89e5b0f6bd4843ec13279d710ef677c1ad488be8
-IMAGE_BUILD=20260722-2547
-IMAGE_NAME=debian-13-genericcloud-amd64-${IMAGE_BUILD}.qcow2
-IMAGE_SHA512=735d1b2d0ef265a0c2323fdaa7d46e7bd7a1b984f73e8a785e638034bf07876e26374a9d809d713501270c071b3464d2ada0c5589f07742b95ed853cc6d48f45
-
-NEEDS_APPDATA=0
-NEEDS_SYSLOG=0
-case "$PROFILE" in
-  deb_13_plain.yml)
-    PROFILE_SHA256=0063162b93792f0a556369057066477493980b643fee9c0656e6c7cce3ba55d3
-    ;;
-  deb_13_plain_syslog.yml)
-    PROFILE_SHA256=b681821a6424f8879fc74181a9c1582b91330f910cee895644a5bcb92720227d
-    NEEDS_SYSLOG=1
-    ;;
-  deb_13_docker.yml)
-    PROFILE_SHA256=2ba0da339fa7733429cec33212cfcb648c716c71b6890f66a838cab44893ab32
-    NEEDS_APPDATA=1
-    ;;
-  deb_13_docker_syslog.yml)
-    PROFILE_SHA256=e75271a82b0d2f4cd0ae39b7c9e2cd9a789524a88deb4aee0631e76f972eb65b
-    NEEDS_APPDATA=1
-    NEEDS_SYSLOG=1
-    ;;
-  *)
-    echo "Unsupported profile: $PROFILE" >&2
-    exit 1
-    ;;
-esac
-
-IMAGE_PATH=${ISO_STORAGE_PATH}/${IMAGE_NAME}
-SNIPPET_PATH=${SNIPPET_STORAGE_PATH}/${PROFILE}
-
-# Fail before changing Proxmox if an input or storage path is wrong.
-test -d "$SNIPPET_STORAGE_PATH"
-test -d "$ISO_STORAGE_PATH"
-test -r "$SSH_PUBLIC_KEY_FILE"
-ssh-keygen -l -f "$SSH_PUBLIC_KEY_FILE"
-git -C "$REPO_ROOT" cat-file -e "${CLOUD_INIT_REF}^{commit}"
-
-# Export and verify the reviewed profile, independent of the checked-out branch.
-git -C "$REPO_ROOT" show "${CLOUD_INIT_REF}:cloud-init/${PROFILE}" >"$SNIPPET_PATH"
-chmod 0600 "$SNIPPET_PATH"
-printf '%s  %s\n' "$PROFILE_SHA256" "$SNIPPET_PATH" | sha256sum --check -
-
-# Apply deterministic syslog customization after verifying the source profile.
-if [ "$NEEDS_SYSLOG" -eq 1 ]; then
-  case "$SYSLOG_SERVER" in
-    ""|*[!A-Za-z0-9.-]*)
-      echo "Set SYSLOG_SERVER to the receiver IP address or DNS name." >&2
-      exit 1
-      ;;
-  esac
-
-  sed -i \
-    "s/logs\\.example\\.invalid/${SYSLOG_SERVER}/g" \
-    "$SNIPPET_PATH"
-fi
-
-# Download and verify the reviewed Debian cloud image.
-if [ ! -f "$IMAGE_PATH" ]; then
-  curl --fail --location --proto '=https' --tlsv1.2 --retry 5 \
-    --output "$IMAGE_PATH" \
-    "https://cloud.debian.org/images/cloud/trixie/${IMAGE_BUILD}/${IMAGE_NAME}"
-fi
-printf '%s  %s\n' "$IMAGE_SHA512" "$IMAGE_PATH" | sha512sum --check -
-
-if command -v cloud-init >/dev/null; then
-  cloud-init schema --config-file "$SNIPPET_PATH"
-fi
-
-# Create the VM and inject the SSH key through Proxmox cloud-init data.
-qm create "$VMID" \
-  --name "$NAME" \
-  --cores "$CPU" \
-  --cpu host \
-  --memory "$MEM_MAX" \
-  --balloon "$MEM_MIN" \
-  --net0 "virtio,bridge=${BRIDGE},queues=${CPU},firewall=1" \
-  --scsihw virtio-scsi-single \
-  --serial0 socket \
-  --vga serial0 \
-  --cicustom "vendor=${SNIPPET_STORAGE_NAME}:snippets/${PROFILE}" \
-  --agent 1 \
-  --ostype l26 \
-  --localtime 0 \
-  --tablet 0
-
-qm set "$VMID" --rng0 source=/dev/urandom,max_bytes=1024,period=1000
-qm set "$VMID" \
-  --ciuser admin \
-  --sshkeys "$SSH_PUBLIC_KEY_FILE" \
-  --ipconfig0 ip=dhcp
-
-qm importdisk "$VMID" "$IMAGE_PATH" "$VM_STORAGE_NAME"
-ROOT_VOLUME="$(
-  qm config "$VMID" |
-    awk -F': ' '/^unused[0-9]+: / { print $2; exit }'
-)"
-test -n "$ROOT_VOLUME"
-qm set "$VMID" \
-  --scsi0 "${ROOT_VOLUME},ssd=1,discard=on,iothread=1"
-
-if [ "$NEEDS_APPDATA" -eq 1 ]; then
-  qm set "$VMID" \
-    --scsi1 "${VM_STORAGE_NAME}:${APPDATA_DISK_SIZE},ssd=1,discard=on,iothread=1,backup=1,serial=APPDATA,wwn=0x2000000000000001"
-fi
-
-qm set "$VMID" \
-  --ide2 "${VM_STORAGE_NAME}:cloudinit" \
-  --boot order=scsi0
-qm template "$VMID"
+cp cloud-init/tools/.env.example cloud-init/tools/.env
+chmod 0600 cloud-init/tools/.env
+nano cloud-init/tools/.env
 ```
 
-The source profile checksum is checked before the deterministic syslog
-customization. The block also validates the final customized snippet when
-`cloud-init` is available on the Proxmox host. To validate it explicitly:
+Review the VM IDs, name prefix, SSH public key, network bridge,
+storage names, and Proxmox paths. `VMID_START` must begin a range of four unused
+VM IDs.
+
+Validate the configuration and templates:
 
 ```bash
-cloud-init schema --config-file "$SNIPPET_PATH"
+./cloud-init/tools/validate.sh
+git diff --check -- cloud-init
 ```
 
-## First boot and operations
+Build all four templates based on your .env file:
 
-Clone the template, review its network settings, and start the clone. Package
-installation can take several minutes.
+```bash
+./cloud-init/tools/create_proxmox_template.sh
+```
 
-- Success: the VM writes `/var/lib/cloud/instance/boot-success`, captures its
-  diagnostic logs, and powers off.
-- Failure: the success marker is absent and the VM stays running.
+The build directory will contain five YAML files and four `create-*.sh`
+scripts. Building does not change templates that already exist in Proxmox.
 
-Keep the cloud-init drive attached. Cloud-init's per-instance state prevents
-the bootstrap from rerunning on ordinary reboots, while the drive remains
-available for correct instance metadata and future clones.
+## Install a template on Proxmox
 
-Useful diagnostics:
+### If you do not have SSH keys setup (Manually copy files)
+
+Copy all nine files from `cloud-init/build/` to the Proxmox snippets folder set
+by `PROXMOX_SNIPPET_PATH` in `cloud-init/tools/.env`.
+
+### If you have SSH keys setup
+
+From the repository root on the build machine, set your Proxmox hostname and
+copy the generated bundle:
+
+```bash
+PROXMOX_HOST=pve.example.com
+PROXMOX_SNIPPET_PATH=/mnt/pve/cloud-init/snippets
+
+scp cloud-init/build/* "root@${PROXMOX_HOST}:${PROXMOX_SNIPPET_PATH}/"
+ssh "root@${PROXMOX_HOST}"
+```
+
+The commands below use `/mnt/pve/cloud-init/snippets`. Replace that path if
+your `PROXMOX_SNIPPET_PATH` setting is different.
+
+On the Proxmox host, run the script for each template you want:
+
+| Template | Command |
+| --- | --- |
+| Plain | `bash /mnt/pve/cloud-init/snippets/create-deb13-plain-template.sh` |
+| Plain + syslog | `bash /mnt/pve/cloud-init/snippets/create-deb13-plain-syslog-template.sh` |
+| Docker | `bash /mnt/pve/cloud-init/snippets/create-deb13-docker-template.sh` |
+| Docker + syslog | `bash /mnt/pve/cloud-init/snippets/create-deb13-docker-syslog-template.sh` |
+
+For example:
+
+```bash
+bash /mnt/pve/cloud-init/snippets/create-deb13-plain-template.sh
+```
+
+The script downloads and verifies the Debian image, confirms the VM ID is
+unused, and creates the selected Proxmox template. Keep the generated YAML
+snippets available to Proxmox so its cloud-init drive can be regenerated.
+
+After cloning and starting a template, check first-boot provisioning inside the
+guest:
 
 ```bash
 sudo cloud-init status --long
-sudo journalctl -b -u cloud-final.service
-sudo less /home/admin/logs/cloud-init-errors.log
-sudo less /home/admin/logs/cloud-init-full.log
 ```
 
-For Docker profiles, verify that APPDATA has exactly one kernel mount:
+A successful first boot records diagnostics and powers off. A failed first boot
+stays running so it can be inspected from the Proxmox console.
 
-```bash
-test "$(findmnt -rn --mountpoint /mnt/appdata -o TARGET | wc -l)" -eq 1
-```
+## To Do List
 
-Ongoing unattended upgrades are security-only and never reboot
-automatically. Schedule full OS upgrades, Docker upgrades, image pruning, and
-required reboots through your normal maintenance or configuration-management
-workflow.
-
-## Editing and validation
-
-The four deployable YAML files are generated. Edit
-`templates/deb_13.yml.tmpl`, then render and validate:
-
-```bash
-python3 cloud-init/tools/render_profiles.py
-cloud-init/tools/validate.sh
-```
-
-Validation covers cloud-init schema, YAML lint, embedded shell scripts, Docker
-daemon JSON, the pinned Docker signing-key fingerprint, rsyslog syntax, SSH
-baseline consistency, APPDATA destructive-operation and single-mount guards,
-success gating, and generated-file drift. CI runs the same validation in
-Debian 13.
+- Replace plain TCP syslog with authenticated TLS or RELP.
+- Add collector delivery confirmation and rsyslog queue monitoring.
+- Add QEMU/Proxmox first-boot integration tests for every profile and APPDATA
+  failure mode.
+- Rootless Docker

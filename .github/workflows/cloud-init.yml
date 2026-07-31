@@ -32,12 +32,10 @@ jobs:
               DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 cloud-init \
                 docker.io \
-                git \
                 gnupg \
                 python3-yaml \
                 rsyslog \
-                rsyslog-openssl \
                 shellcheck \
                 yamllint
-              cloud-init/tools/validate.sh
+              cloud-init/tools/validate.sh --full
             '

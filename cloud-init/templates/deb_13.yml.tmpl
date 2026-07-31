@@ -13,28 +13,17 @@ timezone: America/Chicago
 ssh_pwauth: false
 disable_root: true
 
-users:
-  - name: admin
-    gecos: Admin
-    groups: [adm, sudo]
-    shell: /bin/bash
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    lock_passwd: true
-
 #% if docker
 # The cloud-init mounts module is the sole owner of this mount. bootcmd only
 # validates or creates the filesystem so the same target cannot be mounted twice.
 mounts:
-  - [LABEL=APPDATA, /mnt/appdata, ext4, "defaults,noatime,x-systemd.growfs,nodev,x-systemd.device-timeout=30s", "0", "2"]
+  - ["/dev/disk/by-id/wwn-@@APPDATA_WWN@@", /mnt/appdata, ext4, "defaults,noatime,x-systemd.growfs,nodev,x-systemd.device-timeout=30s", "0", "2"]
 
 bootcmd:
   - |
     set -eu
 
-    marker=/var/lib/cloud/instance/sem/appdata-provisioned
-    [ -e "$marker" ] && exit 0
-
-    app_link=/dev/disk/by-id/wwn-0x2000000000000001
+    app_link=/dev/disk/by-id/wwn-@@APPDATA_WWN@@
     udevadm settle
     [ -L "$app_link" ] || {
       echo "APPDATA disk is missing: expected $app_link" >&2
@@ -48,7 +37,7 @@ bootcmd:
     }
 
     app_serial="$(lsblk -dn -o SERIAL "$app_dev" | xargs)"
-    [ "$app_serial" = APPDATA ] || {
+    [ "$app_serial" = "@@APPDATA_SERIAL@@" ] || {
       echo "APPDATA serial mismatch on $app_dev: $app_serial" >&2
       exit 1
     }
@@ -97,8 +86,6 @@ bootcmd:
     fi
 
     install -d -m 0755 /mnt/appdata
-    install -d -m 0700 "$(dirname "$marker")"
-    touch "$marker"
 #% endif
 
 write_files:
@@ -158,7 +145,7 @@ write_files:
       backend = systemd
       banaction = nftables-multiport
       banaction_allports = nftables-allports
-      ignoreip = 127.0.0.1/8 ::1
+      ignoreip = @@FAIL2BAN_IGNORE_IPS@@
 
       [sshd]
       enabled = true
@@ -228,6 +215,82 @@ write_files:
     content: |
       [Unit]
       RequiresMountsFor=/mnt/appdata
+      Requires=appdata-verify.service
+      After=appdata-verify.service
+
+  - path: /usr/local/sbin/appdata-verify
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -Eeuo pipefail
+
+      expected_link=/dev/disk/by-id/wwn-@@APPDATA_WWN@@
+      udevadm settle
+      [ -L "$expected_link" ] || {
+        echo "APPDATA disk is missing: expected $expected_link" >&2
+        exit 1
+      }
+
+      expected_dev="$(readlink -f -- "$expected_link")"
+      [ -b "$expected_dev" ] || {
+        echo "APPDATA target is not a block device: $expected_dev" >&2
+        exit 1
+      }
+
+      expected_serial="$(lsblk -dn -o SERIAL -- "$expected_dev" | xargs)"
+      [ "$expected_serial" = "@@APPDATA_SERIAL@@" ] || {
+        echo "APPDATA serial mismatch on $expected_dev: $expected_serial" >&2
+        exit 1
+      }
+
+      mountpoint -q /mnt/appdata || {
+        echo "APPDATA is not mounted at /mnt/appdata" >&2
+        exit 1
+      }
+      app_mount_count="$(findmnt -rn --mountpoint /mnt/appdata -o TARGET | wc -l)"
+      [ "$app_mount_count" -eq 1 ] || {
+        echo "APPDATA must be mounted exactly once; found $app_mount_count mounts" >&2
+        findmnt -rn --mountpoint /mnt/appdata -o TARGET,SOURCE,FSTYPE,OPTIONS >&2 || true
+        exit 1
+      }
+
+      mounted_source="$(findmnt -rn --mountpoint /mnt/appdata -o SOURCE)"
+      mounted_dev="$(readlink -f -- "$mounted_source")"
+      [ -b "$mounted_dev" ] || {
+        echo "APPDATA mount source is not a block device: $mounted_source" >&2
+        exit 1
+      }
+
+      expected_id="$(lsblk -dn -o MAJ:MIN -- "$expected_dev" | xargs)"
+      mounted_id="$(lsblk -dn -o MAJ:MIN -- "$mounted_dev" | xargs)"
+      if [ -z "$expected_id" ] || [ "$mounted_id" != "$expected_id" ]; then
+        echo "APPDATA source mismatch: expected $expected_dev, mounted $mounted_dev" >&2
+        exit 1
+      fi
+
+      [ "$(findmnt -rn --mountpoint /mnt/appdata -o FSTYPE)" = ext4 ] || {
+        echo "APPDATA mount is not ext4" >&2
+        exit 1
+      }
+      [ "$(blkid -s LABEL -o value "$mounted_dev")" = APPDATA ] || {
+        echo "APPDATA filesystem label is not APPDATA" >&2
+        exit 1
+      }
+
+  - path: /etc/systemd/system/appdata-verify.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Verify APPDATA disk identity before Docker starts
+      RequiresMountsFor=/mnt/appdata
+      Before=docker.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/appdata-verify
+      RemainAfterExit=yes
 
   - path: /etc/docker/daemon.json
     owner: root:root
@@ -259,7 +322,7 @@ write_files:
       RateLimitIntervalSec=30s
       RateLimitBurst=5000
 
-  # Replace logs.example.invalid with the receiver's IP address or DNS name.
+  # The receiver is rendered from the tracked site configuration.
   - path: /etc/rsyslog.d/01-remote.conf
     owner: root:root
     permissions: "0644"
@@ -268,8 +331,8 @@ write_files:
 
       action(
         type="omfwd"
-        target="logs.example.invalid"
-        port="5140"
+        target="@@SYSLOG_SERVER@@"
+        port="@@SYSLOG_PORT@@"
         protocol="tcp"
         TCP_Framing="traditional"
         template="RSYSLOG_SyslogProtocol23Format"
@@ -337,8 +400,78 @@ write_files:
             /var/log/cloud-init-output.log || true
       } > "$log_dir/cloud-init-errors.log"
 
+      dpkg-query --show --showformat='${binary:Package}\t${Version}\n' \
+        2>/dev/null | sort > "$log_dir/packages.tsv" || true
+#% if docker
+      if ! docker version > "$log_dir/docker-version.txt" 2>&1; then
+        docker --version > "$log_dir/docker-version.txt" 2>&1 || true
+      fi
+#% endif
+
       chown -R admin:admin "$log_dir"
-      chmod 0600 "$log_dir"/*.log
+      find "$log_dir" -maxdepth 1 -type f -exec chmod 0600 {} +
+
+  - path: /usr/local/sbin/cloud-init-post-verify
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -Eeuo pipefail
+
+      success_marker=/var/lib/cloud/instance/boot-success
+      precheck_marker=/var/lib/cloud/instance/bootstrap-precheck-ok
+      rm -f "$success_marker"
+
+      on_error() {
+        local exit_code="$1"
+        local failure_line="$2"
+        trap - ERR
+        rm -f "$success_marker"
+        /usr/local/sbin/cloud-init-report failure "$exit_code" "$failure_line" || true
+        exit "$exit_code"
+      }
+      trap 'on_error "$?" "$LINENO"' ERR
+
+      if [ ! -f "$precheck_marker" ]; then
+        echo "cloud-init bootstrap prechecks did not complete" >&2
+        on_error 1 "$LINENO"
+      fi
+      if [ ! -f /var/lib/cloud/instance/boot-finished ]; then
+        echo "cloud-init boot-finished marker is missing" >&2
+        on_error 1 "$LINENO"
+      fi
+
+      set +e
+      cloud_status_output="$(cloud-init status --format json 2>&1)"
+      cloud_status_exit="$?"
+      set -e
+      printf '%s\n' "$cloud_status_output"
+      if [ "$cloud_status_exit" -ne 0 ]; then
+        echo "cloud-init completed with status $cloud_status_exit" >&2
+        on_error "$cloud_status_exit" "$LINENO"
+      fi
+
+      /usr/local/sbin/cloud-init-report success 0 0
+      touch "$success_marker"
+      /usr/sbin/shutdown --poweroff +1 \
+        "cloud-init validated successfully; shutting down"
+      trap - ERR
+
+  - path: /etc/systemd/system/cloud-init-post-verify.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Validate completed cloud-init bootstrap
+      Wants=cloud-init.target
+      After=cloud-init.target
+      ConditionPathExists=/var/lib/cloud/instance/bootstrap-precheck-ok
+      ConditionPathExists=!/var/lib/cloud/instance/boot-success
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/cloud-init-post-verify
+      RemainAfterExit=yes
 
   - path: /usr/local/sbin/cloud-init-finalize
     owner: root:root
@@ -348,30 +481,32 @@ write_files:
       set -Eeuo pipefail
 
       success_marker=/var/lib/cloud/instance/boot-success
-      rm -f "$success_marker"
+      precheck_marker=/var/lib/cloud/instance/bootstrap-precheck-ok
+      rm -f "$success_marker" "$precheck_marker"
 
       on_error() {
         local exit_code="$1"
         local failure_line="$2"
         trap - ERR
+        rm -f "$precheck_marker"
         /usr/local/sbin/cloud-init-report failure "$exit_code" "$failure_line" || true
         exit "$exit_code"
       }
       trap 'on_error "$?" "$LINENO"' ERR
 
-      [ -d /home/admin ] || {
+      if [ ! -d /home/admin ]; then
         echo "admin user was not created" >&2
-        exit 1
-      }
+        on_error 1 "$LINENO"
+      fi
       install -d -m 0700 -o admin -g admin /home/admin/.ssh
       install -d -m 0700 -o admin -g admin /home/admin/apps
       chown -R admin:admin /home/admin
       chmod 0700 /home/admin
 
-      [ -s /home/admin/.ssh/authorized_keys ] || {
+      if [ ! -s /home/admin/.ssh/authorized_keys ]; then
         echo "No SSH key was supplied for admin through Proxmox cloud-init data" >&2
-        exit 1
-      }
+        on_error 1 "$LINENO"
+      fi
       ssh-keygen -l -f /home/admin/.ssh/authorized_keys >/dev/null
 
       install -d -m 0755 /run/sshd
@@ -397,20 +532,8 @@ write_files:
       systemctl enable --now fstrim.timer
 
 #% if docker
-      mountpoint -q /mnt/appdata || {
-        echo "APPDATA is not mounted at /mnt/appdata" >&2
-        exit 1
-      }
-      app_mount_count="$(findmnt -rn --mountpoint /mnt/appdata -o TARGET | wc -l)"
-      [ "$app_mount_count" -eq 1 ] || {
-        echo "APPDATA must be mounted exactly once; found $app_mount_count mounts" >&2
-        findmnt -rn --mountpoint /mnt/appdata -o TARGET,SOURCE,FSTYPE,OPTIONS >&2 || true
-        exit 1
-      }
-      app_source="$(findmnt -rn --mountpoint /mnt/appdata -o SOURCE)"
-      [ "$(blkid -s LABEL -o value "$app_source")" = APPDATA ]
-      [ "$(blkid -s TYPE -o value "$app_source")" = ext4 ]
-
+      systemctl start appdata-verify.service
+      systemctl is-active --quiet appdata-verify.service
       install -d -m 0710 /mnt/appdata/docker
       /usr/bin/dockerd --validate --config-file /etc/docker/daemon.json
       usermod -aG docker admin
@@ -420,11 +543,6 @@ write_files:
 #% endif
 
 #% if syslog
-      if grep -q "logs.example.invalid" /etc/rsyslog.d/01-remote.conf; then
-        echo "Replace logs.example.invalid with the remote syslog address" >&2
-        exit 1
-      fi
-
       sed -i -E \
         's/^[[:space:]]*module\(load="imuxsock".*$/# disabled: using imjournal/; s/^[[:space:]]*module\(load="imklog".*$/# disabled: using imjournal/' \
         /etc/rsyslog.conf
@@ -437,9 +555,9 @@ write_files:
       logger -t cloud-init "remote syslog forwarding smoke test"
 #% endif
 
-      install -d -m 0700 "$(dirname "$success_marker")"
-      /usr/local/sbin/cloud-init-report success 0 0
-      touch "$success_marker"
+      install -d -m 0700 "$(dirname "$precheck_marker")"
+      touch "$precheck_marker"
+      systemctl start --no-block cloud-init-post-verify.service
       trap - ERR
 
 package_update: true
@@ -474,9 +592,3 @@ resize_rootfs: true
 
 runcmd:
   - [/usr/local/sbin/cloud-init-finalize]
-
-power_state:
-  mode: poweroff
-  message: "cloud-init validated successfully; shutting down"
-  delay: 1
-  condition: [test, -f, /var/lib/cloud/instance/boot-success]

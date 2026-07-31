@@ -1,0 +1,149 @@
+#!/bin/bash
+# Generated locally for one template. Copy/paste or run it on Proxmox.
+set -Eeuo pipefail
+
+VMID=@@VMID@@
+NAME=@@NAME@@
+NEEDS_APPDATA=@@NEEDS_APPDATA@@
+CPU=@@CPU@@
+MEM_MIN=@@MEM_MIN@@
+MEM_MAX=@@MEM_MAX@@
+BRIDGE=@@BRIDGE@@
+VM_STORAGE_NAME=@@VM_STORAGE_NAME@@
+SNIPPET_STORAGE_NAME=@@SNIPPET_STORAGE_NAME@@
+PROXMOX_SNIPPET_PATH=@@PROXMOX_SNIPPET_PATH@@
+ISO_STORAGE_PATH=@@ISO_STORAGE_PATH@@
+APPDATA_DISK_SIZE=@@APPDATA_DISK_SIZE@@
+APPDATA_SERIAL=@@APPDATA_SERIAL@@
+APPDATA_WWN=@@APPDATA_WWN@@
+
+USER_SNIPPET_NAME=@@USER_SNIPPET_NAME@@
+USER_SHA256=@@USER_SHA256@@
+VENDOR_SNIPPET_NAME=@@VENDOR_SNIPPET_NAME@@
+VENDOR_SHA256=@@VENDOR_SHA256@@
+
+IMAGE_NAME=@@IMAGE_NAME@@
+IMAGE_SHA512=@@IMAGE_SHA512@@
+IMAGE_URL=@@IMAGE_URL@@
+
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "Required command is missing: $1"
+}
+
+[ "$(id -u)" -eq 0 ] || fail "Run these commands as root on Proxmox"
+for command in awk curl mktemp mv qm sha256sum sha512sum; do
+  require_command "$command"
+done
+
+[ -d "$PROXMOX_SNIPPET_PATH" ] || \
+  fail "Proxmox snippet directory is missing: $PROXMOX_SNIPPET_PATH"
+[ -d "$ISO_STORAGE_PATH" ] || \
+  fail "Proxmox ISO directory is missing: $ISO_STORAGE_PATH"
+
+user_path="${PROXMOX_SNIPPET_PATH}/${USER_SNIPPET_NAME}"
+[ -r "$user_path" ] || fail "User snippet is missing: $user_path"
+printf '%s  %s\n' "$USER_SHA256" "$user_path" | sha256sum --check -
+
+vendor_path="${PROXMOX_SNIPPET_PATH}/${VENDOR_SNIPPET_NAME}"
+[ -r "$vendor_path" ] || fail "Vendor snippet is missing: $vendor_path"
+printf '%s  %s\n' "$VENDOR_SHA256" "$vendor_path" | sha256sum --check -
+
+if command -v cloud-init >/dev/null 2>&1; then
+  cloud-init schema --config-file "$user_path"
+  cloud-init schema --config-file "$vendor_path"
+fi
+
+# Fail before changing Proxmox if this template ID is already in use.
+if qm config "$VMID" >/dev/null 2>&1; then
+  fail "VMID $VMID already exists"
+fi
+
+image_path="${ISO_STORAGE_PATH}/${IMAGE_NAME}"
+image_temp=""
+vm_created=0
+current_vmid=""
+cleanup() {
+  local original_exit_code="$?"
+  trap - EXIT
+  [ -z "$image_temp" ] || rm -f -- "$image_temp"
+  if [ "$original_exit_code" -ne 0 ] && \
+    [ "$vm_created" -eq 1 ] && [ -n "$current_vmid" ]; then
+    echo "Removing VM $current_vmid created by the failed invocation" >&2
+    qm destroy "$current_vmid" --purge 1 >/dev/null 2>&1 || \
+      echo "WARNING: could not remove partial VM $current_vmid" >&2
+  fi
+  exit "$original_exit_code"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ ! -e "$image_path" ]; then
+  image_temp="$(mktemp --tmpdir="$ISO_STORAGE_PATH" ".${IMAGE_NAME}.XXXXXX")"
+  curl --fail --location --proto '=https' --tlsv1.2 --retry 5 \
+    --output "$image_temp" "$IMAGE_URL"
+  printf '%s  %s\n' "$IMAGE_SHA512" "$image_temp" | sha512sum --check -
+  chmod 0644 "$image_temp"
+  mv --no-clobber -- "$image_temp" "$image_path"
+  [ -e "$image_temp" ] || image_temp=""
+fi
+printf '%s  %s\n' "$IMAGE_SHA512" "$image_path" | sha512sum --check -
+
+create_template() {
+  local vmid="$1"
+  local name="$2"
+  local vendor_snippet_name="$3"
+  local needs_appdata="$4"
+  local root_volume
+
+  current_vmid="$vmid"
+  vm_created=1
+  qm create "$vmid" \
+    --name "$name" \
+    --cores "$CPU" \
+    --cpu host \
+    --memory "$MEM_MAX" \
+    --balloon "$MEM_MIN" \
+    --net0 "virtio,bridge=${BRIDGE},queues=${CPU},firewall=1" \
+    --scsihw virtio-scsi-single \
+    --serial0 socket \
+    --vga serial0 \
+    --cicustom "vendor=${SNIPPET_STORAGE_NAME}:snippets/${vendor_snippet_name},user=${SNIPPET_STORAGE_NAME}:snippets/${USER_SNIPPET_NAME}" \
+    --agent 1 \
+    --ostype l26 \
+    --localtime 0 \
+    --tablet 0
+  qm set "$vmid" --rng0 source=/dev/urandom,max_bytes=1024,period=1000
+  qm set "$vmid" --ipconfig0 ip=dhcp
+
+  qm importdisk "$vmid" "$image_path" "$VM_STORAGE_NAME"
+  root_volume="$(
+    qm config "$vmid" |
+      awk -F': ' '/^unused[0-9]+: / && !found { print $2; found=1 }'
+  )"
+  [ -n "$root_volume" ] || fail "Could not identify the imported root volume"
+  qm set "$vmid" \
+    --scsi0 "${root_volume},ssd=1,discard=on,iothread=1"
+
+  if [ "$needs_appdata" -eq 1 ]; then
+    qm set "$vmid" \
+      --scsi1 "${VM_STORAGE_NAME}:${APPDATA_DISK_SIZE},ssd=1,discard=on,iothread=1,backup=1,serial=${APPDATA_SERIAL},wwn=${APPDATA_WWN}"
+  fi
+
+  qm set "$vmid" \
+    --ide2 "${VM_STORAGE_NAME}:cloudinit" \
+    --boot order=scsi0
+  qm template "$vmid"
+  vm_created=0
+  current_vmid=""
+  echo "Created Proxmox template $vmid ($name)"
+}
+
+create_template "$VMID" "$NAME" "$VENDOR_SNIPPET_NAME" "$NEEDS_APPDATA"
+
+echo "Created Proxmox template $VMID ($NAME) successfully"
