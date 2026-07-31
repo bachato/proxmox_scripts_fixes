@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -184,6 +186,77 @@ def validate_rsyslog(files: dict[str, str], profile_name: str) -> None:
     )
 
 
+def validate_readme() -> None:
+    path = ROOT / "readme.md"
+    content = path.read_text(encoding="utf-8")
+
+    for stale_text in (
+        "raw.githubusercontent.com",
+        "docker_graylog.yml",
+        "ssh_authorized_keys:",
+        "/home/logs",
+    ):
+        if stale_text in content:
+            raise SystemExit(f"readme.md: stale instruction remains: {stale_text}")
+
+    reference_match = re.search(
+        r"^CLOUD_INIT_REF=([0-9a-f]{40})$",
+        content,
+        flags=re.MULTILINE,
+    )
+    if not reference_match:
+        raise SystemExit("readme.md: immutable CLOUD_INIT_REF is missing")
+    reference = reference_match.group(1)
+
+    repository = ROOT.parent
+    run(["git", "-C", str(repository), "cat-file", "-e", f"{reference}^{{commit}}"])
+
+    for profile in PROFILES:
+        hash_match = re.search(
+            rf"^\s*{re.escape(profile.output)}\)\s*$"
+            rf"\s*PROFILE_SHA256=([0-9a-f]{{64}})$",
+            content,
+            flags=re.MULTILINE,
+        )
+        if not hash_match:
+            raise SystemExit(f"readme.md: SHA-256 pin is missing for {profile.output}")
+
+        expected_hash = hash_match.group(1)
+        current_hash = hashlib.sha256((ROOT / profile.output).read_bytes()).hexdigest()
+        if current_hash != expected_hash:
+            raise SystemExit(f"readme.md: current {profile.output} does not match its pin")
+
+        pinned_profile = run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "show",
+                f"{reference}:cloud-init/{profile.output}",
+            ]
+        )
+        pinned_hash = hashlib.sha256(pinned_profile.encode("utf-8")).hexdigest()
+        if pinned_hash != expected_hash:
+            raise SystemExit(
+                f"readme.md: {profile.output} does not match CLOUD_INIT_REF"
+            )
+
+    image_hash = re.search(
+        r"^IMAGE_SHA512=([0-9a-f]{128})$",
+        content,
+        flags=re.MULTILINE,
+    )
+    if not image_hash:
+        raise SystemExit("readme.md: Debian image SHA-512 pin is missing")
+
+    bash_blocks = re.findall(r"```bash\n(.*?)\n```", content, flags=re.DOTALL)
+    if not bash_blocks:
+        raise SystemExit("readme.md: provisioning shell block is missing")
+    run(["bash", "-n"], input_text=bash_blocks[0])
+    validate_shell(bash_blocks[0], "readme.md:provisioning", "bash")
+    print("readme.md immutable inputs and provisioning shell validated")
+
+
 def main() -> int:
     ssh_baseline: str | None = None
 
@@ -259,6 +332,7 @@ def main() -> int:
         elif any(path.startswith("/etc/rsyslog") for path in files):
             raise SystemExit(f"{profile.output}: unexpected rsyslog configuration")
 
+    validate_readme()
     print("All cloud-init profiles validated")
     return 0
 

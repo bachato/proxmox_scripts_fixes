@@ -1,311 +1,285 @@
-# Cloud init, optimized for Debian 13
+# Debian 13 cloud-init profiles for Proxmox
 
-## What is this?
+These profiles create a hardened Debian 13 VM, optionally with Docker and/or
+remote syslog. They are intended to be attached as Proxmox custom vendor data
+and run once on a clone's first boot.
 
-I made this so you can spin up a new VM, with Docker pre-installed, and everything configured - in minutes.
-I do this by providing you with all the proxmox CLI commands to prevision a new VM quickly and ready for cloud-init.
+## Supported profiles
 
-Cloud-init is one of the fastest ways to spin up a pre-configured new VM.
-The cloud-init config file runs on VM first boot and installs, updates and configures all of our apps for us!
-Simply add your docker-compose.yml file and go!
+| Profile | Docker | Remote syslog | APPDATA disk |
+| --- | --- | --- | --- |
+| `deb_13_plain.yml` | No | No | No |
+| `deb_13_plain_syslog.yml` | No | TLS | No |
+| `deb_13_docker.yml` | Yes | No | Required |
+| `deb_13_docker_syslog.yml` | Yes | TLS | Required |
 
-I have spent a lot of time making sure this follows best practices for security and stability.  If you have suggestions on how to improve, let me know!
+Files under `archive/` are historical references, not supported deployment
+profiles.
 
-## deb_13_plain.yml
+All supported profiles:
 
-  - Disable Root Login
-  - Disable Password Authentication (SSH Only! Add your SSH keys in the file)
-  - Installs Unattended Upgrades (Stable Only, Reboots at 3:40am if needed)
-  - Installs qemu-guest-agent
-  - Installs cloud-guest-utils (To auto grow disk if you expand it later. Auto expands at boot)
-  - Uses separate disk for appdata, mounted to /mnt/appdata.  The entire docker folder (/var/lib/docker/) is mounted to /mnt/appdata/docker.  Default is 16GB, you can grow it in proxmox if needed.
-  - Mounts /mnt/appdata with with nodev for additional security
-  - Installs systemd-zram-generator for swap (to reduce disk I/O)
-  - Installs fail2ban to monitor logs for intrusion attempts
-  - Hardens SSHD
-  - Hardens Kernel Modules (May need to disable some if you use complex networking setups, multiple NIC's or VPN's)
-  - Shuts down the VM after cloud-init is complete
-  - Dumps cloud-init log file at /home/admin/logs on first boot
+- create the `admin` user and require a valid SSH public key supplied by
+  Proxmox;
+- disable root and password SSH login, install fail2ban, and validate sshd
+  before declaring success;
+- apply the kernel hardening and zram settings during bootstrap;
+- install and verify the QEMU guest agent, unattended-upgrades, fail2ban, and
+  zram swap;
+- perform a full package upgrade during image bootstrap, then configure
+  security-only unattended upgrades without automatic reboot;
+- write final diagnostic logs to `/home/admin/logs/`; and
+- power off only after every final validation succeeds.
 
-## deb_13_plain_syslog.yml
+If bootstrap fails, the VM deliberately remains running. Use its console and
+the cloud-init logs to diagnose the failure.
 
-  - Same as deb_13_plain.yml
-  - Configures VM with rsyslog and forwards to log server using rsyslog (Make sure you set your syslog server IP in the file.)
-  - To reduce disk I/O, persistent Local Logging is disabled.  I forward all logs to external syslog and keep local logs in memory only.  This means logs will be lost on reboot and will live on your syslog server only.
+## Docker APPDATA safety contract
 
-## deb_13_docker.yml
+Docker profiles require one dedicated, whole, unpartitioned data disk with:
 
-- Same as deb_13_plain.yml
-- Installs Docker
-- Sets some reasonable defaults
-- Uses separate disk for appdata, mounted to /mnt/appdata.  The entire docker folder (/var/lib/docker/) is mounted to /mnt/appdata/docker.  Default is 16GB, you can grow it in proxmox if needed.
+- WWN `0x2000000000000001`;
+- serial `APPDATA`; and
+- either no existing signatures or an existing ext4 filesystem labeled
+  `APPDATA`.
 
-## deb_13_docker_syslog.yml
+The bootstrap refuses to format a disk unless all of those checks pass. It
+also rejects the root device chain, partitioned devices, and disks containing
+unknown signatures. `/mnt/appdata` is a required mount; Docker cannot start
+without it.
 
-- Same as deb_13_docker.yml Plus:
-- Configures VM with rsyslog and forwards to log server using rsyslog (Make sure you set your syslog server IP in the file.)
-- To reduce disk I/O, persistent Local Logging is disabled.  I forward all logs to external syslog and keep local logs in memory only.  This means logs will be lost on reboot and will live on your syslog server only.
+Do not attach that WWN and serial to any other disk in the same VM.
 
-## Step By Step Guide to using these files:
+## Remote syslog behavior
 
-### 1. Batch commands to create a new VM Template in Proxmox.
+The syslog profiles send RFC 5424 logs over server-authenticated TLS on TCP
+port 6514. Before first boot, replace both occurrences of
+`logs.example.invalid` with the DNS name in the receiver certificate.
+Bootstrap fails while the placeholder remains.
 
-Edit the configurables that you care about and then you can simply copy/paste the entire block into your CLI.
+The receiver's issuing CA must be trusted:
 
-Note: Currently does not work with VM storage set to "local".  These commands assume you're using zfs for VM storage. (snippet and ISO storage can be local, but VM provisioning commands are not compatible with local storage.)  
+- Public CA: leave `SYSLOG_CA_FILE` empty in the provisioning block.
+- Private CA: set `SYSLOG_CA_FILE` to the issuing CA's PEM certificate.
 
-##### Provision VM - Debian 13 - Docker - Local Logging
+The provisioning block adds a private CA through cloud-init's `ca_certs`
+module, and the finalizer runs `update-ca-certificates` before validating
+rsyslog.
 
-<details>
-  <summary>Debian 13 - Docker - Local Logging</summary>
+These profiles intentionally do not claim that logging is memory-only.
+Journald uses up to 64 MiB of volatile storage, Debian's default local rsyslog
+file actions are bypassed, and rsyslog has a root-only disk-assisted queue
+bounded to 256 MiB for receiver outages. Cloud-init bootstrap logs and the
+final diagnostic copies remain persistent.
 
-```
-# ------------ Begin Required Config ------------- #
+The smoke-test message is tagged `cloud-init`. Confirm that it arrives at the
+receiver before treating remote logging as operational.
 
-# Set your VMID
+## Create a Proxmox template
+
+Run these commands as root on a Proxmox host. Adjust every value in the first
+block. The repository checkout must contain commit
+`dfcb7bfd871968497517c63a955aeb170eb9f263`.
+
+The example retains the existing trust model: `admin` has passwordless sudo,
+Docker profiles add `admin` to the Docker group, and Proxmox firewall
+enforcement still depends on the host's firewall rules.
+
+```bash
+set -euo pipefail
+
+# Required configuration
 VMID=9000
+NAME=debian13-template
+PROFILE=deb_13_docker.yml
+SSH_PUBLIC_KEY_FILE=/root/.ssh/id_ed25519.pub
+REPO_ROOT=/root/proxmox_scripts_fixes
 
-# Set your VM Name
-NAME=debian13-docker
+SNIPPET_STORAGE_NAME=local
+SNIPPET_STORAGE_PATH=/var/lib/vz/snippets
+ISO_STORAGE_PATH=/var/lib/vz/template/iso
+VM_STORAGE_NAME=local-zfs
+BRIDGE=vmbr100
 
-# Name of your Proxmox Snippet Storage: (examples: local, local-zfs, smb, rpool.)
-SNIPPET_STORAGE_NAME=bertha-smb
+# Required only for a syslog profile
+SYSLOG_SERVER_NAME=
+SYSLOG_CA_FILE=
 
-# Path to your Proxmox Snippet Storage: (Local storage is usually mounted at /var/lib/vz/snippets, remote at /mnt/pve/)
-SNIPPET_STORAGE_PATH=/mnt/pve/bertha-smb/snippets
-
-# Path to your Proxmox ISO Storage: (Local storage is usually mounted at /var/lib/vz/template/iso, remote at /mnt/pve/)
-ISO_STORAGE_PATH=/mnt/pve/bertha-smb/template/iso
-
-# Name of your Proxmox VM Storage: (examples: local, local-zfs, smb, rpool)
-VM_STORAGE_NAME=apool
-
-# ------------ End Required Config ------------- #
-
-# ------------ Begin Optional Config ------------- #
-
-# Size of your Appdata Disk in GB
-APPDATA_DISK_SIZE=16
-
-# VM Hardware Config
+# Optional sizing
 CPU=4
 MEM_MIN=1024
 MEM_MAX=4096
+APPDATA_DISK_SIZE=16
 
-# ------------ End Optional Config ------------- #
+# Reviewed, immutable inputs
+CLOUD_INIT_REF=dfcb7bfd871968497517c63a955aeb170eb9f263
+IMAGE_BUILD=20260722-2547
+IMAGE_NAME=debian-13-genericcloud-amd64-${IMAGE_BUILD}.qcow2
+IMAGE_SHA512=735d1b2d0ef265a0c2323fdaa7d46e7bd7a1b984f73e8a785e638034bf07876e26374a9d809d713501270c071b3464d2ada0c5589f07742b95ed853cc6d48f45
 
-# Grab Debian 13 ISO
-wget -O $ISO_STORAGE_PATH/debian-13-genericcloud-amd64-20251006-2257.qcow2 https://cloud.debian.org/images/cloud/trixie/20251006-2257/debian-13-genericcloud-amd64-20251006-2257.qcow2
+NEEDS_APPDATA=0
+NEEDS_SYSLOG=0
+case "$PROFILE" in
+  deb_13_plain.yml)
+    PROFILE_SHA256=0063162b93792f0a556369057066477493980b643fee9c0656e6c7cce3ba55d3
+    ;;
+  deb_13_plain_syslog.yml)
+    PROFILE_SHA256=90aa612019cb1856929c670ca981015d90b75aea46b19f32139fc1fd29d8ed52
+    NEEDS_SYSLOG=1
+    ;;
+  deb_13_docker.yml)
+    PROFILE_SHA256=2bac876a760563377069d7378264a26133e4b1153ff4c650cacbe75123bf12d0
+    NEEDS_APPDATA=1
+    ;;
+  deb_13_docker_syslog.yml)
+    PROFILE_SHA256=64968182356ac7fd01e26264016936d9070cd0d0f768eafec4a0cfa97985a153
+    NEEDS_APPDATA=1
+    NEEDS_SYSLOG=1
+    ;;
+  *)
+    echo "Unsupported profile: $PROFILE" >&2
+    exit 1
+    ;;
+esac
 
-# Grab Cloud Init yml
-wget -O $SNIPPET_STORAGE_PATH/cloud-init-debian13-docker.yaml https://raw.githubusercontent.com/samssausages/proxmox_scripts_fixes/708825ff3f4c78ca7118bd97cd40f082bbf19c03/cloud-init/docker.yml
+IMAGE_PATH=${ISO_STORAGE_PATH}/${IMAGE_NAME}
+SNIPPET_PATH=${SNIPPET_STORAGE_PATH}/${PROFILE}
 
-# Generate unique serial and wwn for appdata disk
-APP_SERIAL="APPDATA-$VMID"
-APP_WWN="$(printf '0x2%015x' "$VMID")"
+# Fail before changing Proxmox if an input or storage path is wrong.
+test -d "$SNIPPET_STORAGE_PATH"
+test -d "$ISO_STORAGE_PATH"
+test -r "$SSH_PUBLIC_KEY_FILE"
+ssh-keygen -l -f "$SSH_PUBLIC_KEY_FILE"
+git -C "$REPO_ROOT" cat-file -e "${CLOUD_INIT_REF}^{commit}"
 
-# Create the VM
-qm create $VMID \
-  --name $NAME \
-  --cores $CPU \
+# Export and verify the reviewed profile, independent of the checked-out branch.
+git -C "$REPO_ROOT" show "${CLOUD_INIT_REF}:cloud-init/${PROFILE}" >"$SNIPPET_PATH"
+chmod 0600 "$SNIPPET_PATH"
+printf '%s  %s\n' "$PROFILE_SHA256" "$SNIPPET_PATH" | sha256sum --check -
+
+# Apply deterministic syslog customization after verifying the source profile.
+if [ "$NEEDS_SYSLOG" -eq 1 ]; then
+  case "$SYSLOG_SERVER_NAME" in
+    ""|*[!A-Za-z0-9.-]*)
+      echo "Set SYSLOG_SERVER_NAME to the receiver certificate's DNS name." >&2
+      exit 1
+      ;;
+  esac
+
+  sed -i \
+    "s/logs\\.example\\.invalid/${SYSLOG_SERVER_NAME}/g" \
+    "$SNIPPET_PATH"
+
+  if [ -n "$SYSLOG_CA_FILE" ]; then
+    test -r "$SYSLOG_CA_FILE"
+    openssl x509 -in "$SYSLOG_CA_FILE" -noout -subject -issuer
+    {
+      printf '\nca_certs:\n  trusted:\n    - |\n'
+      sed 's/^/        /' "$SYSLOG_CA_FILE"
+    } >>"$SNIPPET_PATH"
+  fi
+fi
+
+# Download and verify the reviewed Debian cloud image.
+if [ ! -f "$IMAGE_PATH" ]; then
+  curl --fail --location --proto '=https' --tlsv1.2 --retry 5 \
+    --output "$IMAGE_PATH" \
+    "https://cloud.debian.org/images/cloud/trixie/${IMAGE_BUILD}/${IMAGE_NAME}"
+fi
+printf '%s  %s\n' "$IMAGE_SHA512" "$IMAGE_PATH" | sha512sum --check -
+
+if command -v cloud-init >/dev/null; then
+  cloud-init schema --config-file "$SNIPPET_PATH"
+fi
+
+# Create the VM and inject the SSH key through Proxmox cloud-init data.
+qm create "$VMID" \
+  --name "$NAME" \
+  --cores "$CPU" \
   --cpu host \
-  --memory $MEM_MAX \
-  --balloon $MEM_MIN \
-  --net0 virtio,bridge=vmbr100,queues=$CPU,firewall=1 \
+  --memory "$MEM_MAX" \
+  --balloon "$MEM_MIN" \
+  --net0 "virtio,bridge=${BRIDGE},queues=${CPU},firewall=1" \
   --scsihw virtio-scsi-single \
   --serial0 socket \
   --vga serial0 \
-  --cicustom "vendor=$SNIPPET_STORAGE_NAME:snippets/cloud-init-debian13-docker.yaml" \
+  --cicustom "vendor=${SNIPPET_STORAGE_NAME}:snippets/${PROFILE}" \
   --agent 1 \
   --ostype l26 \
   --localtime 0 \
   --tablet 0
 
-qm set $VMID -rng0 source=/dev/urandom,max_bytes=1024,period=1000
-qm set $VMID --ciuser admin --ipconfig0 ip=dhcp
-qm importdisk $VMID "$ISO_STORAGE_PATH/debian-13-genericcloud-amd64-20251006-2257.qcow2" "$VM_STORAGE_NAME"
-qm set $VMID --scsi0 $VM_STORAGE_NAME:vm-$VMID-disk-0,ssd=1,discard=on,iothread=1
-qm set $VMID --scsi1 $VM_STORAGE_NAME:$APPDATA_DISK_SIZE,ssd=1,discard=on,iothread=1,backup=1,serial=$APP_SERIAL,wwn=$APP_WWN
-qm set $VMID --ide2 $VM_STORAGE_NAME:cloudinit --boot order=scsi0
-qm template $VMID
+qm set "$VMID" --rng0 source=/dev/urandom,max_bytes=1024,period=1000
+qm set "$VMID" \
+  --ciuser admin \
+  --sshkeys "$SSH_PUBLIC_KEY_FILE" \
+  --ipconfig0 ip=dhcp
+
+qm importdisk "$VMID" "$IMAGE_PATH" "$VM_STORAGE_NAME"
+ROOT_VOLUME="$(
+  qm config "$VMID" |
+    awk -F': ' '/^unused[0-9]+: / { print $2; exit }'
+)"
+test -n "$ROOT_VOLUME"
+qm set "$VMID" \
+  --scsi0 "${ROOT_VOLUME},ssd=1,discard=on,iothread=1"
+
+if [ "$NEEDS_APPDATA" -eq 1 ]; then
+  qm set "$VMID" \
+    --scsi1 "${VM_STORAGE_NAME}:${APPDATA_DISK_SIZE},ssd=1,discard=on,iothread=1,backup=1,serial=APPDATA,wwn=0x2000000000000001"
+fi
+
+qm set "$VMID" \
+  --ide2 "${VM_STORAGE_NAME}:cloudinit" \
+  --boot order=scsi0
+qm template "$VMID"
 ```
 
-</details>
+The source profile checksum is checked before the deterministic syslog
+customization. The block also validates the final customized snippet when
+`cloud-init` is available on the Proxmox host. To validate it explicitly:
 
-##### Provision VM - Debian 13 - Docker - Remote Syslog
-
-<details>
-  <summary>Debian 13 - Docker - Remote Syslog Logging</summary>
-
-```
-# ------------ Begin Required Config ------------- #
-
-# Set your VMID
-VMID=9000
-
-# Set your VM Name
-NAME=debian13-docker
-
-# Name of your Proxmox Snippet Storage: (examples: local, local-zfs, smb, rpool.)
-SNIPPET_STORAGE_NAME=bertha-smb
-
-# Path to your Proxmox Snippet Storage: (Local storage is usually mounted at /var/lib/vz/snippets, remote at /mnt/pve/)
-SNIPPET_STORAGE_PATH=/mnt/pve/bertha-smb/snippets
-
-# Path to your Proxmox ISO Storage: (Local storage is usually mounted at /var/lib/vz/template/iso, remote at /mnt/pve/)
-ISO_STORAGE_PATH=/mnt/pve/bertha-smb/template/iso
-
-# Name of your Proxmox VM Storage: (examples: local, local-zfs, smb, rpool)
-VM_STORAGE_NAME=apool
-
-# ------------ End Required Config ------------- #
-
-# ------------ Begin Optional Config ------------- #
-
-# Size of your Appdata Disk in GB
-APPDATA_DISK_SIZE=16
-
-# VM Hardware Config
-CPU=4
-MEM_MIN=1024
-MEM_MAX=4096
-
-# ------------ End Optional Config ------------- #
-
-# Grab Debian 13 ISO
-wget -O $ISO_STORAGE_PATH/debian-13-genericcloud-amd64-20251006-2257.qcow2 https://cloud.debian.org/images/cloud/trixie/20251006-2257/debian-13-genericcloud-amd64-20251006-2257.qcow2
-
-# Grab Cloud Init yml
-wget -O $SNIPPET_STORAGE_PATH/cloud-init-debian13-docker-log.yaml https://raw.githubusercontent.com/samssausages/proxmox_scripts_fixes/52620f2ba9b02b38c8d5fec7d42cbcd1e0e30449/cloud-init/docker_graylog.yml
-
-
-# Generate unique serial and wwn for appdata disk
-APP_SERIAL="APPDATA-$VMID"
-APP_WWN="$(printf '0x2%015x' "$VMID")"
-
-# Create the VM
-qm create $VMID \
-  --name $NAME \
-  --cores $CPU \
-  --cpu host \
-  --memory $MEM_MAX \
-  --balloon $MEM_MIN \
-  --net0 virtio,bridge=vmbr100,queues=$CPU,firewall=1 \
-  --scsihw virtio-scsi-single \
-  --serial0 socket \
-  --vga serial0 \
-  --cicustom "vendor=$SNIPPET_STORAGE_NAME:snippets/cloud-init-debian13-docker-log.yaml" \
-  --agent 1 \
-  --ostype l26 \
-  --localtime 0 \
-  --tablet 0
-
-qm set $VMID -rng0 source=/dev/urandom,max_bytes=1024,period=1000
-qm set $VMID --ciuser admin --ipconfig0 ip=dhcp
-qm importdisk $VMID "$ISO_STORAGE_PATH/debian-13-genericcloud-amd64-20251006-2257.qcow2" "$VM_STORAGE_NAME"
-qm set $VMID --scsi0 $VM_STORAGE_NAME:vm-$VMID-disk-0,ssd=1,discard=on,iothread=1
-qm set $VMID --scsi1 $VM_STORAGE_NAME:$APPDATA_DISK_SIZE,ssd=1,discard=on,iothread=1,backup=1,serial=$APP_SERIAL,wwn=$APP_WWN
-qm set $VMID --ide2 $VM_STORAGE_NAME:cloudinit --boot order=scsi0
-qm template $VMID
+```bash
+cloud-init schema --config-file "$SNIPPET_PATH"
 ```
 
-</details>
+## First boot and operations
 
-### 2a. Add your SSH keys to the cloud-init YAML file
+Clone the template, review its network settings, and start the clone. Package
+installation can take several minutes.
 
-Open the cloud-init YAML file that you downloaded to your Proxmox snippets folder and add your SSH public keys to the "ssh_authorized_keys:" section.
+- Success: the VM writes `/var/lib/cloud/instance/boot-success`, captures its
+  diagnostic logs, and powers off.
+- Failure: the success marker is absent and the VM stays running.
 
-```
-nano $SNIPPET_STORAGE_PATH/cloud-init-debian13-docker.yaml
-```
+Keep the cloud-init drive attached. Cloud-init's per-instance state prevents
+the bootstrap from rerunning on ordinary reboots, while the drive remains
+available for correct instance metadata and future clones.
 
-### 2b. If you are using the Docker_graylog.yml file, set your syslog server IP address
+Useful diagnostics:
 
-### 3.  Set Network info in Proxmox GUI and generate cloud-init config
-
-In the Proxmox GUI, go to the cloud-init section and configure as needed (i.e. set IP address if not using DHCP). SSH keys are set in our snippet file, but I add them here anyways. Keep the user name as "admin". Complex network setups may require you to set your DNS server here.
-
-Click "Generate Cloud-Init Configuration"
-
-Right click the template -> Clone
-
-### 4. Get new VM clone ready to launch
-
-This is your last opportunity to make any last minute changes to the hardware config.  I usually set the MAC address on the NIC and let my DHCP server assign an IP.
-
-### 5. Launch new VM for the first time
-
-Start the new VM and wait.  It may take 2-10 minutes depending on your system and internet speed.  The system will now download packages and update the system.  The VM will turn off when cloud-init is finished.
-
-If the VM doesn't shut down and just sits at a login prompt, then cloud-init likely failed.  Check logs for failure reasons.  Validate cloud-init and try again.
-
-### 6. Remove cloud-init drive from the "hardware" section before starting your new VM
-
-### 7. Access your new VM!
-
-Check logs inside VM to confirm cloud-init completed successfully, they will be in the /home/logs directory
-
-### 8. (Optional) Increase the VM disk size in proxmox GUI, if needed & reboot VM
-
-### 9. Add and Compose up your docker-compose.yml file and enjoy your new Docker Debian 13 VM!
-
-### Troubleshooting:
-
-Check Cloud-Init logs from inside VM.  We dump them to /home/logs  This should be your first step if something is not working as expected and done after first vm boot.
-
-Additional commands to validate config files and check cloud-init logs:
-
-```
+```bash
 sudo cloud-init status --long
+sudo journalctl -b -u cloud-final.service
+sudo less /home/admin/logs/cloud-init-errors.log
+sudo less /home/admin/logs/cloud-init-full.log
 ```
 
-Cloud init validate file from host:
+Ongoing unattended upgrades are security-only and never reboot
+automatically. Schedule full OS upgrades, Docker upgrades, image pruning, and
+required reboots through your normal maintenance or configuration-management
+workflow.
 
+## Editing and validation
+
+The four deployable YAML files are generated. Edit
+`templates/deb_13.yml.tmpl`, then render and validate:
+
+```bash
+python3 cloud-init/tools/render_profiles.py
+cloud-init/tools/validate.sh
 ```
-cloud-init schema --config-file ./cloud-config.yml --annotate
-```
 
-Cloud init validate file from inside VM:
-
-```
-sudo cloud-init schema --system --annotate
-``` 
-
-### FAQ & Common Reasons for Cloud-Init Failures:
-
-- Incorrect YAML formatting (use a YAML validator to check your file & run cloud-init schema validate commands)
-- Network issues preventing package downloads - Your VM can't access the web
-- Incorrect SSH key format
-- Insufficient VM resources (CPU, RAM)
-- Proxmox storage name doesn't match what is in the commands
-- Your not using the proxmox mounted "snippet" folder
-
-### Notes & Special Considerations:
-
-  - TLDR: When updating the OS & Docker Containers, also run "docker images prune" to keep disk from filling up.
-  The OS disk is only 8gb by default.  This is usually fine, but if you run docker then old images will eventually pile up.  I run updates using an ansible playbook, and at the time of update I also tell docker to prune dangling images.  You can do so with a "docker images prune" command, after your update.
-
-### Changelog:
-
-6-4-2026
-- added tmux
-
-1-17-2026
-- added plain versions that don't install docker and just harden Debian 13
-- Made APPDATA disk creation process more durable to avoid install conflicts
-- Made sure fail2ban is enabled & starts
-- Added sudo & nftables package in case it isn't part of the base image
-
-11-14-2025
-- Added fail2ban
-- Kernel & SSH Hardening 
-
-11-12-2025
-- Made Appdata disk serial unique, generated & detectable by cloud-init
-- Hardened docker appdata mount
-- Dump cloud-init log into /home/logs on first boot
-- Added debug option to logging (disabled by default)
-- Made logging more durable by setting limits & queue
-- Improved readme
-- Improved and expanded proxmox CLI Template Commands
-- Greatly simplified setup process
+Validation covers cloud-init schema, YAML lint, embedded shell scripts, Docker
+daemon JSON, the pinned Docker signing-key fingerprint, rsyslog syntax, SSH
+baseline consistency, APPDATA destructive-operation guards, success gating,
+and generated-file drift. CI runs the same validation in Debian 13.
