@@ -209,6 +209,12 @@ def validate_common(
         raise SystemExit(f"{profile_name}: final validation must be the only runcmd")
     if config.get("package_reboot_if_required") is not False:
         raise SystemExit(f"{profile_name}: package upgrades must not reboot bootstrap")
+    if config.get("preserve_hostname") is not False:
+        raise SystemExit(f"{profile_name}: cloud-init must update the hostname")
+    if config.get("create_hostname_file") is not True:
+        raise SystemExit(f"{profile_name}: cloud-init must create /etc/hostname")
+    if config.get("manage_etc_hosts") is not True:
+        raise SystemExit(f"{profile_name}: cloud-init must manage /etc/hosts")
 
     finalizer = files["/usr/local/sbin/cloud-init-finalize"]
     require_fragments(
@@ -221,6 +227,10 @@ def validate_common(
             "fail2ban-client -t",
             "/usr/sbin/sshd -t",
             "/usr/local/sbin/cloud-init-report failure",
+            "cloud-init query v1.local_hostname",
+            'hostnamectl --static 2>/dev/null || true',
+            'if [ "$(hostname)" != "$cloud_hostname" ]',
+            'if [ "$(cat /etc/hostname)" != "$cloud_hostname" ]',
             'touch "$precheck_marker"',
             "systemctl start --no-block cloud-init-post-verify.service",
         ),
@@ -230,6 +240,10 @@ def validate_common(
         raise SystemExit(f"{profile_name}: finalizer reports success before cloud-init ends")
     if 'touch "$success_marker"' in finalizer:
         raise SystemExit(f"{profile_name}: finalizer writes the success marker too early")
+    if "hostnamectl set-hostname" in finalizer:
+        raise SystemExit(
+            f"{profile_name}: finalizer must validate, not change, the hostname"
+        )
 
     post_verifier = files["/usr/local/sbin/cloud-init-post-verify"]
     require_fragments(

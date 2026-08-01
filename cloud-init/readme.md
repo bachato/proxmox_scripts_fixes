@@ -127,3 +127,7 @@ stays running so it can be inspected from the Proxmox console.
 - Add QEMU/Proxmox first-boot integration tests for every profile and APPDATA
   failure mode.
 - Rootless Docker
+
+## How is AI used in this repo?
+
+I use AI as a tool and a search engine.  I do not add code or features that I do not understand, or have not reviewed.

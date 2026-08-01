@@ -7,6 +7,7 @@ output:
 final_message: "cloud-init modules finished after $UPTIME seconds; check cloud-init status --long"
 
 preserve_hostname: false
+create_hostname_file: true
 manage_etc_hosts: true
 timezone: America/Chicago
 
@@ -493,6 +494,55 @@ write_files:
         exit "$exit_code"
       }
       trap 'on_error "$?" "$LINENO"' ERR
+
+      cloud_hostname="$(
+        cloud-init query v1.local_hostname 2>/dev/null || true
+      )"
+
+      case "$cloud_hostname" in
+        ""|localhost|localhost.localdomain)
+          echo \
+            "Cloud-init did not provide a valid local hostname: ${cloud_hostname:-missing}" \
+            >&2
+          on_error 1 "$LINENO"
+          ;;
+        *.)
+          echo \
+            "Cloud-init provided a hostname with a trailing dot: $cloud_hostname" \
+            >&2
+          on_error 1 "$LINENO"
+          ;;
+      esac
+
+      static_hostname="$(
+        hostnamectl --static 2>/dev/null || true
+      )"
+
+      if [ "$static_hostname" != "$cloud_hostname" ]; then
+        echo \
+          "Static hostname mismatch: expected=$cloud_hostname actual=${static_hostname:-missing}" \
+          >&2
+        on_error 1 "$LINENO"
+      fi
+
+      if [ "$(hostname)" != "$cloud_hostname" ]; then
+        echo \
+          "Runtime hostname mismatch: expected=$cloud_hostname actual=$(hostname)" \
+          >&2
+        on_error 1 "$LINENO"
+      fi
+
+      if [ ! -s /etc/hostname ]; then
+        echo "/etc/hostname was not created" >&2
+        on_error 1 "$LINENO"
+      fi
+
+      if [ "$(cat /etc/hostname)" != "$cloud_hostname" ]; then
+        echo \
+          "/etc/hostname mismatch: expected=$cloud_hostname actual=$(cat /etc/hostname)" \
+          >&2
+        on_error 1 "$LINENO"
+      fi
 
       if [ ! -d /home/admin ]; then
         echo "admin user was not created" >&2
