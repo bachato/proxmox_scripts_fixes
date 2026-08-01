@@ -34,7 +34,7 @@ Every template installs `ca-certificates`, `cloud-guest-utils`, `fail2ban`,
 First boot also runs a full package update and upgrade before anything else is
 configured.
 
-### Important config
+### Important config (Defaults and .env should be all you need)
 
 | Area | What is set | Where |
 | --- | --- | --- |
