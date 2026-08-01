@@ -38,7 +38,8 @@ configured.
 
 | Area | What is set | Where |
 | --- | --- | --- |
-| User | `admin` with passwordless sudo, locked password, and your SSH key | Proxmox cloud-init user data |
+| User | `admin` username and SSH key supplied through Proxmox-generated user-data using `ciuser` and `sshkeys`; policy verified during first-boot finalization | `qm create --ciuser --sshkeys` |
+| Hostname | Generated from the current Proxmox VM name, including after cloning and renaming | Proxmox-generated user-data |
 | SSH | Public key only, no root login, `MaxAuthTries 3`, `LoginGraceTime 30s` | `/etc/ssh/sshd_config.d/99-harden.conf` |
 | fail2ban | Aggressive `sshd` jail, 30m escalating bans, nftables actions, allow list from `FAIL2BAN_IGNORE_IPS` | `/etc/fail2ban/jail.local` |
 | Kernel | Restricted kptr and ptrace, unprivileged BPF off, ICMP redirects off, strict `rp_filter`, SYN cookies | `/etc/sysctl.d/20-hardening.conf` |
@@ -103,14 +104,14 @@ Build all four templates based on your .env file:
 ./cloud-init/tools/create_proxmox_template.sh
 ```
 
-The build directory will contain five YAML files and four `create-*.sh`
+The build directory will contain four YAML files and four `create-*.sh`
 scripts. Building does not change templates that already exist in Proxmox.
 
 ## Install Step #2: add template on Proxmox
 
 ### If you do not have SSH keys setup (Manually copy files)
 
-Copy all nine files from `cloud-init/build/` to the Proxmox snippets folder set
+Copy all eight files from `cloud-init/build/` to the Proxmox snippets folder set
 by `PROXMOX_SNIPPET_PATH` in `cloud-init/tools/.env`.
 
 ### If you have SSH keys setup
@@ -157,4 +158,4 @@ stays running so it can be inspected from the Proxmox console.
 
 ## How is AI used in this repo?
 
-I use AI as a tool and a search engine.  I do not add code or features that I do not understand, or have not reviewed.
+I use AI as a tool and a search engine, not a replacement.  I do not add code or features that I do not understand, or have not reviewed.

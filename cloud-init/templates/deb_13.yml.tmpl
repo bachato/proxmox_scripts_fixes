@@ -421,6 +421,7 @@ write_files:
 
       success_marker=/var/lib/cloud/instance/boot-success
       precheck_marker=/var/lib/cloud/instance/bootstrap-precheck-ok
+      approved_deprecation="'user' of type string is deprecated in 22.2 and scheduled to be removed in 27.2. Use 'users' list instead."
       rm -f "$success_marker"
 
       on_error() {
@@ -442,15 +443,56 @@ write_files:
         on_error 1 "$LINENO"
       fi
 
-      set +e
-      cloud_status_output="$(cloud-init status --format json 2>&1)"
-      cloud_status_exit="$?"
-      set -e
-      printf '%s\n' "$cloud_status_output"
-      if [ "$cloud_status_exit" -ne 0 ]; then
-        echo "cloud-init completed with status $cloud_status_exit" >&2
-        on_error "$cloud_status_exit" "$LINENO"
+      cloud_status_exit=0
+      if cloud_status_output="$(cloud-init status --format json 2>&1)"; then
+        :
+      else
+        cloud_status_exit="$?"
       fi
+      printf '%s\n' "$cloud_status_output"
+      case "$cloud_status_exit" in
+        0)
+          ;;
+        2)
+          if ! /usr/bin/python3 -c '
+      import json
+      import sys
+
+      expected = sys.argv[1]
+      try:
+          status = json.load(sys.stdin)
+      except (json.JSONDecodeError, UnicodeDecodeError):
+          raise SystemExit(1)
+
+      if not isinstance(status, dict):
+          raise SystemExit(1)
+      recoverable = status.get("recoverable_errors")
+      deprecated = (
+          recoverable.get("DEPRECATED")
+          if isinstance(recoverable, dict)
+          else None
+      )
+      approved = (
+          status.get("status") == "done"
+          and status.get("extended_status") == "degraded done"
+          and status.get("errors") == []
+          and isinstance(recoverable, dict)
+          and set(recoverable) == {"DEPRECATED"}
+          and isinstance(deprecated, list)
+          and bool(deprecated)
+          and all(message == expected for message in deprecated)
+      )
+      raise SystemExit(0 if approved else 1)
+      ' "$approved_deprecation" <<<"$cloud_status_output"; then
+            echo "cloud-init degraded for an unapproved reason" >&2
+            on_error "$cloud_status_exit" "$LINENO"
+          fi
+          ;;
+        *)
+          echo "cloud-init completed with status $cloud_status_exit" >&2
+          on_error "$cloud_status_exit" "$LINENO"
+          ;;
+      esac
 
       /usr/local/sbin/cloud-init-report success 0 0
       touch "$success_marker"
@@ -495,57 +537,74 @@ write_files:
       }
       trap 'on_error "$?" "$LINENO"' ERR
 
-      cloud_hostname="$(
-        cloud-init query v1.local_hostname 2>/dev/null || true
-      )"
+      # Proxmox-generated user-data owns the hostname; validate the guest state
+      # it produced instead of the datasource metadata, which NoCloud omits.
+      static_hostname="$(hostnamectl --static 2>/dev/null || true)"
+      runtime_hostname="$(hostname 2>/dev/null || true)"
+      file_hostname="$(tr -d '\n' </etc/hostname 2>/dev/null || true)"
 
-      case "$cloud_hostname" in
-        ""|localhost|localhost.localdomain)
+      case "$static_hostname" in
+        ""|localhost|localhost.localdomain|*.)
           echo \
-            "Cloud-init did not provide a valid local hostname: ${cloud_hostname:-missing}" \
-            >&2
-          on_error 1 "$LINENO"
-          ;;
-        *.)
-          echo \
-            "Cloud-init provided a hostname with a trailing dot: $cloud_hostname" \
+            "Invalid static hostname: ${static_hostname:-missing}" \
             >&2
           on_error 1 "$LINENO"
           ;;
       esac
 
-      static_hostname="$(
-        hostnamectl --static 2>/dev/null || true
-      )"
-
-      if [ "$static_hostname" != "$cloud_hostname" ]; then
+      if [ "$runtime_hostname" != "$static_hostname" ]; then
         echo \
-          "Static hostname mismatch: expected=$cloud_hostname actual=${static_hostname:-missing}" \
+          "Runtime hostname mismatch: static=$static_hostname runtime=$runtime_hostname" \
           >&2
         on_error 1 "$LINENO"
       fi
 
-      if [ "$(hostname)" != "$cloud_hostname" ]; then
+      if [ "$file_hostname" != "$static_hostname" ]; then
         echo \
-          "Runtime hostname mismatch: expected=$cloud_hostname actual=$(hostname)" \
+          "/etc/hostname mismatch: static=$static_hostname file=${file_hostname:-missing}" \
           >&2
         on_error 1 "$LINENO"
       fi
 
-      if [ ! -s /etc/hostname ]; then
-        echo "/etc/hostname was not created" >&2
+      # Proxmox ciuser creates admin from the image default user, so pin the
+      # account policy here rather than trusting the image defaults to hold.
+      if ! getent passwd admin >/dev/null; then
+        echo "admin user was not created" >&2
         on_error 1 "$LINENO"
       fi
 
-      if [ "$(cat /etc/hostname)" != "$cloud_hostname" ]; then
-        echo \
-          "/etc/hostname mismatch: expected=$cloud_hostname actual=$(cat /etc/hostname)" \
-          >&2
+      usermod \
+        --comment Admin \
+        --shell /bin/bash \
+        --append \
+        --groups adm,sudo \
+        admin
+      passwd --lock admin >/dev/null
+
+      install -d -m 0750 /etc/sudoers.d
+      printf '%s\n' \
+        'admin ALL=(ALL) NOPASSWD:ALL' \
+        > /etc/sudoers.d/90-admin
+      chmod 0440 /etc/sudoers.d/90-admin
+      visudo -cf /etc/sudoers.d/90-admin
+
+      [ "$(getent passwd admin | cut -d: -f7)" = /bin/bash ] || {
+        echo "admin shell is not /bin/bash" >&2
         on_error 1 "$LINENO"
-      fi
+      }
+      [ "$(passwd -S admin | awk '{print $2}')" = L ] || {
+        echo "admin password is not locked" >&2
+        on_error 1 "$LINENO"
+      }
+      for admin_group in adm sudo; do
+        id -nG admin | tr ' ' '\n' | grep -Fxq "$admin_group" || {
+          echo "admin is not a member of $admin_group" >&2
+          on_error 1 "$LINENO"
+        }
+      done
 
       if [ ! -d /home/admin ]; then
-        echo "admin user was not created" >&2
+        echo "admin home directory is missing" >&2
         on_error 1 "$LINENO"
       fi
       install -d -m 0700 -o admin -g admin /home/admin/.ssh

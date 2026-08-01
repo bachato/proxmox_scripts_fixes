@@ -20,7 +20,6 @@ from render_profiles import CONFIG, CONFIG_FILE, LOCAL_CONFIG, PROFILES, ROOT, r
 
 
 REPOSITORY = ROOT.parent
-USER_DATA_TEMPLATE = ROOT / "templates" / "proxmox-user-data.yml.tmpl"
 COMMAND_TEMPLATE = ROOT / "templates" / "proxmox-create-command.sh.tmpl"
 IMAGE_BUILD = "20260722-2547"
 IMAGE_SHA512 = (
@@ -80,19 +79,10 @@ def sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def render_user_data(public_key: str) -> str:
-    template = USER_DATA_TEMPLATE.read_text(encoding="utf-8")
-    marker = "@@SSH_PUBLIC_KEY@@"
-    if template.count(marker) != 1:
-        fail("user-data template must contain exactly one SSH key marker")
-    return template.replace(marker, public_key)
-
-
 def render_command(
     *,
     vendor: VendorArtifact,
-    user_name: str,
-    user_hash: str,
+    public_key: str,
 ) -> str:
     replacements = {
         "@@VMID@@": str(vendor.vmid),
@@ -111,8 +101,7 @@ def render_command(
         "@@APPDATA_WWN@@": CONFIG["APPDATA_WWN"],
         "@@VENDOR_SNIPPET_NAME@@": vendor.filename,
         "@@VENDOR_SHA256@@": vendor.digest,
-        "@@USER_SNIPPET_NAME@@": user_name,
-        "@@USER_SHA256@@": user_hash,
+        "@@SSH_PUBLIC_KEY@@": public_key,
         "@@IMAGE_NAME@@": IMAGE_NAME,
         "@@IMAGE_SHA512@@": IMAGE_SHA512,
         "@@IMAGE_URL@@": IMAGE_URL,
@@ -127,19 +116,16 @@ def render_command(
 
 
 def validate_rendered(
-    vendors: tuple[VendorArtifact, ...], user_data: str, command: str
+    vendors: tuple[VendorArtifact, ...], command: str
 ) -> None:
     cloud_init = shutil.which("cloud-init")
     with tempfile.TemporaryDirectory(prefix="cloud-init-bundle-check.") as temp_dir:
         temp_path = Path(temp_dir)
-        user_path = temp_path / "user.yml"
-        user_path.write_text(user_data, encoding="utf-8")
         if cloud_init:
             for vendor in vendors:
                 vendor_path = temp_path / vendor.filename
                 vendor_path.write_text(vendor.content, encoding="utf-8")
                 run([cloud_init, "schema", "--config-file", str(vendor_path)])
-            run([cloud_init, "schema", "--config-file", str(user_path)])
     run(["bash", "-n"], input_text=command)
     shellcheck = shutil.which("shellcheck")
     if shellcheck:
@@ -203,17 +189,13 @@ def vendor_artifacts() -> tuple[VendorArtifact, ...]:
 
 
 def validate_only() -> None:
-    user_data = render_user_data(TEST_SSH_PUBLIC_KEY)
-    user_hash = sha256(user_data)
     vendors = vendor_artifacts()
-    user_name = f"{CONFIG['NAME_PREFIX']}-admin-user.yml"
     for vendor in vendors:
         command = render_command(
             vendor=vendor,
-            user_name=user_name,
-            user_hash=user_hash,
+            public_key=TEST_SSH_PUBLIC_KEY,
         )
-        validate_rendered((vendor,), user_data, command)
+        validate_rendered((vendor,), command)
     print(f"Validated bundle configuration: {CONFIG_FILE}")
 
 
@@ -229,24 +211,20 @@ def build() -> None:
     run([sys.executable, str(ROOT / "tools" / "validate_profiles.py")])
 
     public_key = read_public_key()
-    user_data = render_user_data(public_key)
-    user_hash = sha256(user_data)
     vendors = vendor_artifacts()
-    user_name = f"{CONFIG['NAME_PREFIX']}-admin-user.yml"
     commands = tuple(
         (
             f"create-{vendor.template_name}.sh",
             render_command(
                 vendor=vendor,
-                user_name=user_name,
-                user_hash=user_hash,
+                public_key=public_key,
             ),
             vendor,
         )
         for vendor in vendors
     )
     for _, command, vendor in commands:
-        validate_rendered((vendor,), user_data, command)
+        validate_rendered((vendor,), command)
 
     output_directory = Path(CONFIG["ARTIFACT_OUTPUT_DIR"]).expanduser()
     if not output_directory.is_absolute():
@@ -262,17 +240,6 @@ def build() -> None:
         install_artifact(output_directory, vendor.filename, vendor.content, yaml_mode)
         for vendor in vendors
     ]
-    paths.extend(
-        (
-            install_artifact(
-                output_directory,
-                user_name,
-                user_data,
-                yaml_mode,
-            ),
-        )
-    )
-
     command_mode = (
         stat.S_IRUSR
         | stat.S_IWUSR
@@ -290,7 +257,7 @@ def build() -> None:
     print("Built template bundle from the current local files")
     for path in paths:
         print(path)
-    print("Copy the five YAML files and whichever template scripts you want.")
+    print("Copy the four YAML files and whichever template scripts you want.")
     print("Run any one of these commands on Proxmox:")
     for command_name, _, _ in commands:
         print(f"bash {Path(CONFIG['PROXMOX_SNIPPET_PATH']) / command_name}")

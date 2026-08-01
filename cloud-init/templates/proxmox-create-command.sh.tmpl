@@ -17,10 +17,10 @@ APPDATA_DISK_SIZE=@@APPDATA_DISK_SIZE@@
 APPDATA_SERIAL=@@APPDATA_SERIAL@@
 APPDATA_WWN=@@APPDATA_WWN@@
 
-USER_SNIPPET_NAME=@@USER_SNIPPET_NAME@@
-USER_SHA256=@@USER_SHA256@@
 VENDOR_SNIPPET_NAME=@@VENDOR_SNIPPET_NAME@@
 VENDOR_SHA256=@@VENDOR_SHA256@@
+
+SSH_PUBLIC_KEY=@@SSH_PUBLIC_KEY@@
 
 IMAGE_NAME=@@IMAGE_NAME@@
 IMAGE_SHA512=@@IMAGE_SHA512@@
@@ -36,7 +36,7 @@ require_command() {
 }
 
 [ "$(id -u)" -eq 0 ] || fail "Run these commands as root on Proxmox"
-for command in awk curl mktemp mv qm sha256sum sha512sum; do
+for command in awk curl mktemp mv qm sha256sum sha512sum ssh-keygen; do
   require_command "$command"
 done
 
@@ -45,16 +45,11 @@ done
 [ -d "$ISO_STORAGE_PATH" ] || \
   fail "Proxmox ISO directory is missing: $ISO_STORAGE_PATH"
 
-user_path="${PROXMOX_SNIPPET_PATH}/${USER_SNIPPET_NAME}"
-[ -r "$user_path" ] || fail "User snippet is missing: $user_path"
-printf '%s  %s\n' "$USER_SHA256" "$user_path" | sha256sum --check -
-
 vendor_path="${PROXMOX_SNIPPET_PATH}/${VENDOR_SNIPPET_NAME}"
 [ -r "$vendor_path" ] || fail "Vendor snippet is missing: $vendor_path"
 printf '%s  %s\n' "$VENDOR_SHA256" "$vendor_path" | sha256sum --check -
 
 if command -v cloud-init >/dev/null 2>&1; then
-  cloud-init schema --config-file "$user_path"
   cloud-init schema --config-file "$vendor_path"
 fi
 
@@ -65,12 +60,14 @@ fi
 
 image_path="${ISO_STORAGE_PATH}/${IMAGE_NAME}"
 image_temp=""
+ssh_key_file=""
 vm_created=0
 current_vmid=""
 cleanup() {
   local original_exit_code="$?"
   trap - EXIT
   [ -z "$image_temp" ] || rm -f -- "$image_temp"
+  [ -z "$ssh_key_file" ] || rm -f -- "$ssh_key_file"
   if [ "$original_exit_code" -ne 0 ] && \
     [ "$vm_created" -eq 1 ] && [ -n "$current_vmid" ]; then
     echo "Removing VM $current_vmid created by the failed invocation" >&2
@@ -94,6 +91,13 @@ if [ ! -e "$image_path" ]; then
 fi
 printf '%s  %s\n' "$IMAGE_SHA512" "$image_path" | sha512sum --check -
 
+# Proxmox reads the key from a file and folds it into the user-data it
+# generates, which is also the only place it emits the hostname.
+ssh_key_file="$(mktemp)"
+chmod 0600 "$ssh_key_file"
+printf '%s\n' "$SSH_PUBLIC_KEY" > "$ssh_key_file"
+ssh-keygen -l -f "$ssh_key_file" >/dev/null
+
 create_template() {
   local vmid="$1"
   local name="$2"
@@ -113,7 +117,10 @@ create_template() {
     --scsihw virtio-scsi-single \
     --serial0 socket \
     --vga serial0 \
-    --cicustom "vendor=${SNIPPET_STORAGE_NAME}:snippets/${vendor_snippet_name},user=${SNIPPET_STORAGE_NAME}:snippets/${USER_SNIPPET_NAME}" \
+    --cicustom "vendor=${SNIPPET_STORAGE_NAME}:snippets/${vendor_snippet_name}" \
+    --ciuser admin \
+    --sshkeys "$ssh_key_file" \
+    --ciupgrade 0 \
     --agent 1 \
     --ostype l26 \
     --localtime 0 \
@@ -138,6 +145,21 @@ create_template() {
   qm set "$vmid" \
     --ide2 "${VM_STORAGE_NAME}:cloudinit" \
     --boot order=scsi0
+
+  # The cloud-init drive exists now, so confirm Proxmox really generated the
+  # user-data this template depends on before freezing it.
+  local generated_user_data
+  generated_user_data="$(qm cloudinit dump "$vmid" user)"
+
+  grep -Fxq "hostname: $name" <<<"$generated_user_data" || \
+    fail "Generated user-data is missing hostname: $name"
+
+  grep -Fxq "user: admin" <<<"$generated_user_data" || \
+    fail "Generated user-data is missing user: admin"
+
+  grep -q '^ssh_authorized_keys:' <<<"$generated_user_data" || \
+    fail "Generated user-data is missing SSH authorized keys"
+
   qm template "$vmid"
   vm_created=0
   current_vmid=""

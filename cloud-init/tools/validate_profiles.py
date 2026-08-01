@@ -23,11 +23,9 @@ DOCKER_KEY_SHA256 = "1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b
 DOCKER_KEY_FINGERPRINT = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
 SUCCESS_MARKER = "/var/lib/cloud/instance/boot-success"
 PRECHECK_MARKER = "/var/lib/cloud/instance/bootstrap-precheck-ok"
-USER_DATA_TEMPLATE = ROOT / "templates" / "proxmox-user-data.yml.tmpl"
-TEST_SSH_PUBLIC_KEY = (
-    "ssh-ed25519 "
-    "AAAAC3NzaC1lZDI1NTE5AAAAIB4YrFhM2yPVzO+3kI14mYw3V91sCi1qdtB2bWjBv7E4 "
-    "cloud-init-validation@example.invalid"
+PROXMOX_SCALAR_USER_WARNING = (
+    "'user' of type string is deprecated in 22.2 and scheduled "
+    "to be removed in 27.2. Use 'users' list instead."
 )
 FULL_VALIDATION = False
 
@@ -103,6 +101,240 @@ def validate_shell(script: str, source: str, shell: str) -> None:
         run(["shellcheck", "--shell", shell, "-"], input_text=script)
 
 
+def validate_post_verifier_behavior(post_verifier: str, source: str) -> None:
+    clean_status = {
+        "status": "done",
+        "extended_status": "done",
+        "errors": [],
+        "recoverable_errors": {},
+    }
+    approved_degraded_status = {
+        "status": "done",
+        "extended_status": "degraded done",
+        "errors": [],
+        "recoverable_errors": {
+            "DEPRECATED": [
+                PROXMOX_SCALAR_USER_WARNING,
+                PROXMOX_SCALAR_USER_WARNING,
+            ]
+        },
+    }
+    approved_single_deprecation_status = {
+        "status": "done",
+        "extended_status": "degraded done",
+        "errors": [],
+        "recoverable_errors": {
+            "DEPRECATED": [PROXMOX_SCALAR_USER_WARNING]
+        },
+    }
+    empty_deprecation_status = {
+        "status": "done",
+        "extended_status": "degraded done",
+        "errors": [],
+        "recoverable_errors": {"DEPRECATED": []},
+    }
+    hard_error_status = {
+        "status": "error",
+        "extended_status": "error - done",
+        "errors": ["cloud-init failed"],
+        "recoverable_errors": {},
+    }
+    unexpected_warning_status = {
+        "status": "done",
+        "extended_status": "degraded done",
+        "errors": [],
+        "recoverable_errors": {
+            "DEPRECATED": [PROXMOX_SCALAR_USER_WARNING],
+            "WARNING": ["unexpected recoverable warning"],
+        },
+    }
+    unexpected_deprecation_status = {
+        "status": "done",
+        "extended_status": "degraded done",
+        "errors": [],
+        "recoverable_errors": {
+            "DEPRECATED": ["unexpected deprecation warning"]
+        },
+    }
+    degraded_hard_error_status = {
+        "status": "done",
+        "extended_status": "degraded done",
+        "errors": ["unexpected hard error"],
+        "recoverable_errors": {
+            "DEPRECATED": [PROXMOX_SCALAR_USER_WARNING]
+        },
+    }
+    scenarios = (
+        ("clean", 0, json.dumps(clean_status), True),
+        (
+            "approved-degraded",
+            2,
+            json.dumps(approved_degraded_status),
+            True,
+        ),
+        (
+            "approved-single-deprecation",
+            2,
+            json.dumps(approved_single_deprecation_status),
+            True,
+        ),
+        ("hard-exit", 1, json.dumps(hard_error_status), False),
+        ("unknown-exit", 3, json.dumps(clean_status), False),
+        ("malformed-json", 2, "{not-json", False),
+        (
+            "empty-deprecation",
+            2,
+            json.dumps(empty_deprecation_status),
+            False,
+        ),
+        (
+            "unexpected-warning",
+            2,
+            json.dumps(unexpected_warning_status),
+            False,
+        ),
+        (
+            "unexpected-deprecation",
+            2,
+            json.dumps(unexpected_deprecation_status),
+            False,
+        ),
+        (
+            "degraded-hard-error",
+            2,
+            json.dumps(degraded_hard_error_status),
+            False,
+        ),
+    )
+
+    print(f"post-verifier behavior {source}")
+    with tempfile.TemporaryDirectory(
+        prefix="cloud-init-post-verify-check."
+    ) as temp_dir:
+        root = Path(temp_dir)
+        for name, cloud_status_exit, cloud_status_output, approved in scenarios:
+            scenario_dir = root / name
+            scenario_dir.mkdir()
+            success_marker = scenario_dir / "boot-success"
+            precheck_marker = scenario_dir / "bootstrap-precheck-ok"
+            boot_finished = scenario_dir / "boot-finished"
+            status_fixture = scenario_dir / "status.json"
+            report_log = scenario_dir / "report.log"
+            shutdown_log = scenario_dir / "shutdown.log"
+            cloud_init_stub = scenario_dir / "cloud-init"
+            report_stub = scenario_dir / "cloud-init-report"
+            shutdown_stub = scenario_dir / "shutdown"
+            test_script_path = scenario_dir / "cloud-init-post-verify"
+
+            precheck_marker.touch()
+            boot_finished.touch()
+            status_fixture.write_text(
+                cloud_status_output + "\n",
+                encoding="utf-8",
+            )
+            cloud_init_stub.write_text(
+                "#!/bin/sh\n"
+                'cat "$CLOUD_STATUS_FIXTURE"\n'
+                'exit "$CLOUD_STATUS_EXIT"\n',
+                encoding="utf-8",
+            )
+            report_stub.write_text(
+                "#!/bin/sh\n"
+                'printf \'%s\\n\' "$*" >> "$REPORT_LOG"\n',
+                encoding="utf-8",
+            )
+            shutdown_stub.write_text(
+                "#!/bin/sh\n"
+                'printf \'%s\\n\' "$*" >> "$SHUTDOWN_LOG"\n',
+                encoding="utf-8",
+            )
+
+            test_script = post_verifier
+            replacements = {
+                SUCCESS_MARKER: str(success_marker),
+                PRECHECK_MARKER: str(precheck_marker),
+                "/var/lib/cloud/instance/boot-finished": str(boot_finished),
+                "cloud-init status --format json": (
+                    f"bash {cloud_init_stub} status --format json"
+                ),
+                "/usr/local/sbin/cloud-init-report": f"bash {report_stub}",
+                "/usr/sbin/shutdown": f"bash {shutdown_stub}",
+            }
+            for old, new in replacements.items():
+                if old not in test_script:
+                    raise SystemExit(
+                        f"{source}: test harness could not replace {old}"
+                    )
+                test_script = test_script.replace(old, new)
+            test_script_path.write_text(test_script, encoding="utf-8")
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CLOUD_STATUS_FIXTURE": str(status_fixture),
+                    "CLOUD_STATUS_EXIT": str(cloud_status_exit),
+                    "REPORT_LOG": str(report_log),
+                    "SHUTDOWN_LOG": str(shutdown_log),
+                }
+            )
+            result = subprocess.run(
+                ["bash", str(test_script_path)],
+                text=True,
+                capture_output=True,
+                env=environment,
+                check=False,
+            )
+            expected_exit = 0 if approved else cloud_status_exit
+            if result.returncode != expected_exit:
+                raise SystemExit(
+                    f"{source}: {name} returned {result.returncode}, "
+                    f"expected {expected_exit}\nstdout:\n{result.stdout}"
+                    f"stderr:\n{result.stderr}"
+                )
+            if cloud_status_output not in result.stdout:
+                raise SystemExit(
+                    f"{source}: {name} did not print captured status output"
+                )
+
+            report_lines = (
+                report_log.read_text(encoding="utf-8").splitlines()
+                if report_log.exists()
+                else []
+            )
+            shutdown_called = shutdown_log.exists()
+            if approved:
+                if not success_marker.is_file():
+                    raise SystemExit(
+                        f"{source}: {name} did not create the success marker"
+                    )
+                if report_lines != ["success 0 0"]:
+                    raise SystemExit(
+                        f"{source}: {name} emitted unexpected reports: "
+                        f"{report_lines}"
+                    )
+                if not shutdown_called:
+                    raise SystemExit(
+                        f"{source}: {name} did not request shutdown"
+                    )
+            else:
+                if success_marker.exists():
+                    raise SystemExit(
+                        f"{source}: {name} created the success marker"
+                    )
+                if len(report_lines) != 1 or not re.fullmatch(
+                    rf"failure {cloud_status_exit} [0-9]+",
+                    report_lines[0],
+                ):
+                    raise SystemExit(
+                        f"{source}: {name} emitted unexpected reports: "
+                        f"{report_lines}"
+                    )
+                if shutdown_called:
+                    raise SystemExit(
+                        f"{source}: {name} requested shutdown after failure"
+                    )
+
+
 def require_fragments(text: str, fragments: tuple[str, ...], source: str) -> None:
     missing = [fragment for fragment in fragments if fragment not in text]
     if missing:
@@ -136,47 +368,6 @@ def validate_systemd_unit(
             raise SystemExit(
                 f"{source}: systemd [{section}] is missing entries: {sorted(missing)}"
             )
-
-
-def validate_proxmox_user_data() -> None:
-    template = USER_DATA_TEMPLATE.read_text(encoding="utf-8")
-    marker = "@@SSH_PUBLIC_KEY@@"
-    if template.count(marker) != 1:
-        raise SystemExit(
-            f"{USER_DATA_TEMPLATE}: expected exactly one SSH public key marker"
-        )
-    if not template.startswith("#cloud-config\n"):
-        raise SystemExit(f"{USER_DATA_TEMPLATE}: cloud-config header is missing")
-
-    rendered = template.replace(marker, TEST_SSH_PUBLIC_KEY)
-    config = load_yaml(rendered, str(USER_DATA_TEMPLATE))
-    if not isinstance(config, dict) or "user" in config:
-        raise SystemExit(
-            f"{USER_DATA_TEMPLATE}: legacy scalar user configuration is forbidden"
-        )
-
-    expected_user = {
-        "name": "admin",
-        "gecos": "Admin",
-        "groups": ["adm", "sudo"],
-        "shell": "/bin/bash",
-        "sudo": "ALL=(ALL) NOPASSWD:ALL",
-        "lock_passwd": True,
-        "ssh_authorized_keys": [TEST_SSH_PUBLIC_KEY],
-    }
-    if config.get("users") != [expected_user]:
-        raise SystemExit(
-            f"{USER_DATA_TEMPLATE}: admin user configuration is incomplete"
-        )
-
-    if FULL_VALIDATION:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".yml") as rendered_file:
-            rendered_file.write(rendered)
-            rendered_file.flush()
-            print(f"cloud-init schema {USER_DATA_TEMPLATE.name}")
-            run(["cloud-init", "schema", "--config-file", rendered_file.name])
-
-    print("modern Proxmox user-data template validated")
 
 
 def validate_common(
@@ -215,6 +406,11 @@ def validate_common(
         raise SystemExit(f"{profile_name}: cloud-init must create /etc/hostname")
     if config.get("manage_etc_hosts") is not True:
         raise SystemExit(f"{profile_name}: cloud-init must manage /etc/hosts")
+    if "users" in config or "user" in config:
+        raise SystemExit(
+            f"{profile_name}: user identity must be owned by "
+            "Proxmox-generated user-data"
+        )
 
     finalizer = files["/usr/local/sbin/cloud-init-finalize"]
     require_fragments(
@@ -227,10 +423,13 @@ def validate_common(
             "fail2ban-client -t",
             "/usr/sbin/sshd -t",
             "/usr/local/sbin/cloud-init-report failure",
-            "cloud-init query v1.local_hostname",
-            'hostnamectl --static 2>/dev/null || true',
-            'if [ "$(hostname)" != "$cloud_hostname" ]',
-            'if [ "$(cat /etc/hostname)" != "$cloud_hostname" ]',
+            'static_hostname="$(hostnamectl --static 2>/dev/null || true)"',
+            'runtime_hostname="$(hostname 2>/dev/null || true)"',
+            'if [ "$runtime_hostname" != "$static_hostname" ]',
+            'if [ "$file_hostname" != "$static_hostname" ]',
+            "getent passwd admin >/dev/null",
+            "passwd --lock admin",
+            "visudo -cf /etc/sudoers.d/90-admin",
             'touch "$precheck_marker"',
             "systemctl start --no-block cloud-init-post-verify.service",
         ),
@@ -251,14 +450,28 @@ def validate_common(
         (
             PRECHECK_MARKER,
             "/var/lib/cloud/instance/boot-finished",
-            "cloud-init status --format json",
-            'if [ "$cloud_status_exit" -ne 0 ]',
+            'if cloud_status_output="$(cloud-init status --format json 2>&1)"; then',
+            'case "$cloud_status_exit" in',
+            "status.get(\"status\") == \"done\"",
+            "status.get(\"extended_status\") == \"degraded done\"",
+            "status.get(\"errors\") == []",
+            'set(recoverable) == {"DEPRECATED"}',
+            "all(message == expected for message in deprecated)",
+            PROXMOX_SCALAR_USER_WARNING,
             "/usr/local/sbin/cloud-init-report success",
             'touch "$success_marker"',
             "/usr/sbin/shutdown --poweroff +1",
         ),
         profile_name,
     )
+    if "set +e" in post_verifier:
+        raise SystemExit(
+            f"{profile_name}: post-verifier must not disable errexit"
+        )
+    if 'if [ "$cloud_status_exit" -ne 0 ]' in post_verifier:
+        raise SystemExit(
+            f"{profile_name}: post-verifier retains the legacy status policy"
+        )
     success_report = post_verifier.rfind("/usr/local/sbin/cloud-init-report success")
     success_touch = post_verifier.rfind('touch "$success_marker"')
     shutdown = post_verifier.rfind("/usr/sbin/shutdown --poweroff +1")
@@ -559,11 +772,36 @@ def validate_readme() -> None:
     )
     if "qm resize" in command_template:
         raise SystemExit("template creation script must not resize the root disk")
-    for legacy_option in ("--ciuser", "--sshkeys"):
-        if legacy_option in command_template:
-            raise SystemExit(
-                f"template creation script retains legacy Proxmox option {legacy_option}"
-            )
+
+    # Proxmox only emits the hostname in the user-data it generates itself, so
+    # the identity options are required and a custom user= snippet is forbidden.
+    require_fragments(
+        command_template,
+        (
+            "--ciuser admin",
+            '--sshkeys "$ssh_key_file"',
+            "--ciupgrade 0",
+            "SSH_PUBLIC_KEY=@@SSH_PUBLIC_KEY@@",
+            'qm cloudinit dump "$vmid" user',
+        ),
+        "proxmox-create-command.sh.tmpl",
+    )
+
+    cicustom_lines = [
+        line
+        for line in command_template.splitlines()
+        if "--cicustom" in line
+    ]
+
+    if len(cicustom_lines) != 1:
+        raise SystemExit(
+            "creation script must contain exactly one --cicustom option"
+        )
+
+    if "user=" in cicustom_lines[0]:
+        raise SystemExit(
+            "creation script must use Proxmox-generated user-data"
+        )
     if not re.search(r'IMAGE_SHA512 = \(\n(?:\s+"[0-9a-f]+"\n)+\)', builder_script):
         raise SystemExit("template creation script is missing the Debian image pin")
 
@@ -609,8 +847,7 @@ def main() -> int:
         require_full_validation_tools()
 
     ssh_baseline: str | None = None
-
-    validate_proxmox_user_data()
+    post_verifier_baseline: str | None = None
 
     for profile in PROFILES:
         rendered = render(profile)
@@ -632,6 +869,14 @@ def main() -> int:
         config = load_yaml(rendered, profile.output)
         files = write_file_map(config)
         validate_common(config, files, profile.output)
+        post_verifier = files["/usr/local/sbin/cloud-init-post-verify"]
+        if post_verifier_baseline is None:
+            validate_post_verifier_behavior(post_verifier, profile.output)
+            post_verifier_baseline = post_verifier
+        elif post_verifier != post_verifier_baseline:
+            raise SystemExit(
+                f"{profile.output}: post-verifier behavior differs by profile"
+            )
         if "users" in config or "user" in config:
             raise SystemExit(
                 f"{profile.output}: user identity must be owned by custom user data"
