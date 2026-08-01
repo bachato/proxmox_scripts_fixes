@@ -71,7 +71,7 @@ falls behind.
 The builder reads `.env`, renders all four templates, and writes the finished
 bundle to `ARTIFACT_OUTPUT_DIR` (`./cloud-init/build` by default).
 
-## Create the cloud-init templates
+## Install Step #1: Create the cloud-init templates
 
 Run these commands from the repository root on a Linux build machine. The
 validator requires only Python 3 with PyYAML and Bash. Building also requires
@@ -106,7 +106,7 @@ Build all four templates based on your .env file:
 The build directory will contain five YAML files and four `create-*.sh`
 scripts. Building does not change templates that already exist in Proxmox.
 
-## Install a template on Proxmox
+## Install Step #2: add template on Proxmox
 
 ### If you do not have SSH keys setup (Manually copy files)
 

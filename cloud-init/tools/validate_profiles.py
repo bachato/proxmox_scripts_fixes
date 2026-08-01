@@ -480,10 +480,12 @@ def validate_readme() -> None:
 
     expected_headings = (
         "## What this repo does",
+        "## What's inside the templates",
         "## Basic logic of the repo",
-        "## Create the cloud-init templates",
-        "## Install a template on Proxmox",
+        "## Install Step #1: Create the cloud-init templates",
+        "## Install Step #2: add template on Proxmox",
         "## To Do List",
+        "## How is AI used in this repo?",
     )
     actual_headings = tuple(re.findall(r"(?m)^## .+$", content))
     if actual_headings != expected_headings:
@@ -504,7 +506,6 @@ def validate_readme() -> None:
             "cloud-init/tools/create_proxmox_template.sh",
             'scp cloud-init/build/* "root@${PROXMOX_HOST}:${PROXMOX_SNIPPET_PATH}/"',
             "create-deb13-plain-template.sh",
-            "sudo cloud-init status --long",
             "TLS or RELP",
             "QEMU/Proxmox",
         ),
