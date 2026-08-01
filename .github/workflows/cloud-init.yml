@@ -1,0 +1,41 @@
+name: Validate cloud-init profiles
+
+on:
+  push:
+    paths:
+      - ".github/workflows/cloud-init.yml"
+      - "cloud-init/**"
+  pull_request:
+    paths:
+      - ".github/workflows/cloud-init.yml"
+      - "cloud-init/**"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Validate on Debian 13
+        run: |
+          docker run --rm \
+            --volume "$PWD:/repo" \
+            --workdir /repo \
+            debian:13-slim \
+            bash -ceu '
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                cloud-init \
+                docker.io \
+                gnupg \
+                python3-yaml \
+                rsyslog \
+                shellcheck \
+                yamllint
+              cloud-init/tools/validate.sh --full
+            '
