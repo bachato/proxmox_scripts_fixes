@@ -4,7 +4,7 @@
 
 This is my workflow for building VM's using cloud-init, fully configured and ready to go in 2 mintues!
 
-The files in this directory help you bild four hardened Debian 13 templates for Proxmox. Each
+The files in this directory help you build four hardened Debian 13 templates for Proxmox. Each
 template creates an `admin` user with your SSH key, disables password and root
 SSH login, and installs security updates and the QEMU guest agent.
 
@@ -17,6 +17,44 @@ SSH login, and installs security updates and the QEMU guest agent.
 
 Docker variants add a dedicated APPDATA disk.
 Syslog variants send logs over unencrypted TCP, so use them only on a trusted or separately protected network.  (TLS in the future)
+
+## What's inside the templates
+
+### Packages
+
+Every template installs `ca-certificates`, `cloud-guest-utils`, `fail2ban`,
+`nftables`, `openssh-server`, `qemu-guest-agent`, `sudo`,
+`systemd-zram-generator`, `tmux`, and `unattended-upgrades`.
+
+- Docker variants add `docker-ce`, `docker-ce-cli`, `containerd.io`,
+  `docker-buildx-plugin`, and `docker-compose-plugin` from
+  `download.docker.com`, signed by the pinned key in `assets/docker-release.asc`.
+- Syslog variants add `rsyslog`.
+
+First boot also runs a full package update and upgrade before anything else is
+configured.
+
+### Important config
+
+| Area | What is set | Where |
+| --- | --- | --- |
+| User | `admin` with passwordless sudo, locked password, and your SSH key | Proxmox cloud-init user data |
+| SSH | Public key only, no root login, `MaxAuthTries 3`, `LoginGraceTime 30s` | `/etc/ssh/sshd_config.d/99-harden.conf` |
+| fail2ban | Aggressive `sshd` jail, 30m escalating bans, nftables actions, allow list from `FAIL2BAN_IGNORE_IPS` | `/etc/fail2ban/jail.local` |
+| Kernel | Restricted kptr and ptrace, unprivileged BPF off, ICMP redirects off, strict `rp_filter`, SYN cookies | `/etc/sysctl.d/20-hardening.conf` |
+| Updates | Unattended security upgrades, no automatic reboot | `/etc/apt/apt.conf.d/20auto-upgrades`, `52unattended-upgrades-local` |
+| Swap | zram only, `min(ram / 2, 512)` with zstd, `vm.swappiness = 100` | `/etc/systemd/zram-generator.conf` |
+| Disk | Root filesystem grows on first boot, `fstrim.timer` enabled | cloud-init `growpart` |
+| Time | Timezone `America/Chicago` | cloud-init `timezone` |
+| APPDATA (Docker) | Disk checked by WWN and serial, ext4 labelled `APPDATA`, mounted at `/mnt/appdata`; Docker will not start without it | `appdata-verify.service` |
+| Docker | `data-root` on `/mnt/appdata/docker`, journald log driver, live restore, `admin` in the `docker` group | `/etc/docker/daemon.json` |
+| Syslog | Volatile journal (64M), forwarded to `SYSLOG_SERVER:SYSLOG_PORT` over plain TCP with a disk-backed queue and no local `/var/log` copy | `/etc/rsyslog.d/01-remote.conf` |
+| First boot | Self-checks the whole bootstrap, writes logs to `/home/admin/logs/`, then powers off; a failed boot stays running | `cloud-init-post-verify.service` |
+
+Site-specific values such as `SYSLOG_SERVER`, `SYSLOG_PORT`,
+`FAIL2BAN_IGNORE_IPS`, `APPDATA_WWN`, and `APPDATA_SERIAL` come from
+`tools/.env`. `templates/deb_13.yml.tmpl` is the authority if this summary ever
+falls behind.
 
 ## Basic logic of the repo
 
@@ -95,27 +133,16 @@ On the Proxmox host, run the script for each template you want:
 
 | Template | Command |
 | --- | --- |
-| Plain | `bash /mnt/pve/cloud-init/snippets/create-deb13-plain-template.sh` |
-| Plain + syslog | `bash /mnt/pve/cloud-init/snippets/create-deb13-plain-syslog-template.sh` |
-| Docker | `bash /mnt/pve/cloud-init/snippets/create-deb13-docker-template.sh` |
-| Docker + syslog | `bash /mnt/pve/cloud-init/snippets/create-deb13-docker-syslog-template.sh` |
+| Plain | `bash /snippets/create-deb13-plain-template.sh` |
+| Plain + syslog | `bash /snippets/create-deb13-plain-syslog-template.sh` |
+| Docker | `bash /snippets/create-deb13-docker-template.sh` |
+| Docker + syslog | `bash /snippets/create-deb13-docker-syslog-template.sh` |
 
-For example:
-
-```bash
-bash /mnt/pve/cloud-init/snippets/create-deb13-plain-template.sh
-```
 
 The script downloads and verifies the Debian image, confirms the VM ID is
 unused, and creates the selected Proxmox template. Keep the generated YAML
 snippets available to Proxmox so its cloud-init drive can be regenerated.
 
-After cloning and starting a template, check first-boot provisioning inside the
-guest:
-
-```bash
-sudo cloud-init status --long
-```
 
 A successful first boot records diagnostics and powers off. A failed first boot
 stays running so it can be inspected from the Proxmox console.
