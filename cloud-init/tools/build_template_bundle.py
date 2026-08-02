@@ -93,6 +93,7 @@ def render_command(
         "@@MEM_MIN@@": CONFIG["MEM_MIN"],
         "@@MEM_MAX@@": CONFIG["MEM_MAX"],
         "@@BRIDGE@@": CONFIG["BRIDGE"],
+        "@@VLAN_TAG@@": CONFIG["VLAN_TAG"],
         "@@VM_STORAGE_NAME@@": CONFIG["VM_STORAGE_NAME"],
         "@@SNIPPET_STORAGE_NAME@@": CONFIG["SNIPPET_STORAGE_NAME"],
         "@@ISO_STORAGE_PATH@@": CONFIG["ISO_STORAGE_PATH"],

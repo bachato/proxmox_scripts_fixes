@@ -9,6 +9,7 @@ CPU=@@CPU@@
 MEM_MIN=@@MEM_MIN@@
 MEM_MAX=@@MEM_MAX@@
 BRIDGE=@@BRIDGE@@
+VLAN_TAG=@@VLAN_TAG@@
 VM_STORAGE_NAME=@@VM_STORAGE_NAME@@
 SNIPPET_STORAGE_NAME=@@SNIPPET_STORAGE_NAME@@
 ISO_STORAGE_PATH=@@ISO_STORAGE_PATH@@
@@ -112,6 +113,11 @@ create_template() {
   local name="$2"
   local needs_appdata="$3"
   local root_volume
+  local net0
+
+  # An empty VLAN_TAG means the bridge is not a trunk, so emit no tag at all.
+  net0="virtio,bridge=${BRIDGE},queues=${CPU},firewall=1"
+  [ -z "$VLAN_TAG" ] || net0="${net0},tag=${VLAN_TAG}"
 
   current_vmid="$vmid"
   vm_created=1
@@ -121,7 +127,7 @@ create_template() {
     --cpu host \
     --memory "$MEM_MAX" \
     --balloon "$MEM_MIN" \
-    --net0 "virtio,bridge=${BRIDGE},queues=${CPU},firewall=1" \
+    --net0 "$net0" \
     --scsihw virtio-scsi-single \
     --serial0 socket \
     --vga serial0 \

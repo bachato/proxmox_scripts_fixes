@@ -20,9 +20,11 @@ EXAMPLE_CONFIG = ROOT / "tools" / ".env.example"
 
 SITE_KEYS = {
     "BRIDGE",
+    "VLAN_TAG",
     "SYSLOG_SERVER",
     "SYSLOG_PORT",
     "FAIL2BAN_IGNORE_IPS",
+    "SSHD_ALLOW_IPS",
     "APPDATA_WWN",
     "APPDATA_SERIAL",
 }
@@ -41,6 +43,14 @@ BUILD_KEYS = {
     "APPDATA_DISK_SIZE",
 }
 CONFIG_KEYS = SITE_KEYS | BUILD_KEYS
+
+# Keys whose absence, or empty value, means "this feature is not wanted". They
+# are the only keys allowed to be blank, and an operator upgrading the repo does
+# not have to touch an existing .env to keep it valid.
+OPTIONAL_KEYS = {
+    "SSHD_ALLOW_IPS",
+    "VLAN_TAG",
+}
 
 # Keys that used to be required. A live .env is not tracked by Git, so an
 # operator upgrading the repo still has these; say what replaced them instead
@@ -91,11 +101,17 @@ def _config_path() -> Path:
 CONFIG_FILE = _config_path()
 
 
-def _parse_config_value(raw_value: str, line_number: int) -> str:
+def _parse_config_value(
+    raw_value: str, line_number: int, *, allow_empty: bool = False
+) -> str:
     try:
         values = shlex.split(raw_value, comments=False, posix=True)
     except ValueError as error:
         raise ValueError(f"{CONFIG_FILE}:{line_number}: {error}") from error
+    # An optional key is blank either as KEY= (no words at all) or as KEY=''
+    # (one empty word). Both mean the same thing, so accept both.
+    if allow_empty and (not values or (len(values) == 1 and not values[0])):
+        return ""
     if len(values) != 1 or not values[0]:
         raise ValueError(
             f"{CONFIG_FILE}:{line_number}: values containing spaces must be quoted"
@@ -140,14 +156,24 @@ def load_config() -> dict[str, str]:
             raise ValueError(f"{CONFIG_FILE}:{line_number}: unknown key {key}")
         if key in values:
             raise ValueError(f"{CONFIG_FILE}:{line_number}: duplicate key {key}")
-        values[key] = _parse_config_value(raw_value, line_number)
+        values[key] = _parse_config_value(
+            raw_value, line_number, allow_empty=key in OPTIONAL_KEYS
+        )
 
-    missing = sorted(CONFIG_KEYS - values.keys())
+    missing = sorted(CONFIG_KEYS - OPTIONAL_KEYS - values.keys())
     if missing:
         raise ValueError(f"{CONFIG_FILE}: missing required keys: {missing}")
+    for key in OPTIONAL_KEYS:
+        values.setdefault(key, "")
 
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", values["BRIDGE"]):
         raise ValueError(f"{CONFIG_FILE}: BRIDGE contains unsupported characters")
+
+    if values["VLAN_TAG"]:
+        if not values["VLAN_TAG"].isdigit():
+            raise ValueError(f"{CONFIG_FILE}: VLAN_TAG must be a number, or blank")
+        if not 1 <= int(values["VLAN_TAG"]) <= 4094:
+            raise ValueError(f"{CONFIG_FILE}: VLAN_TAG must be between 1 and 4094")
 
     try:
         ipaddress.ip_address(values["SYSLOG_SERVER"])
@@ -178,6 +204,26 @@ def load_config() -> dict[str, str]:
         raise ValueError(
             f"{CONFIG_FILE}: FAIL2BAN_IGNORE_IPS must include IPv4 and IPv6 loopback"
         )
+
+    # Deliberately stricter than FAIL2BAN_IGNORE_IPS above, which is right to
+    # use strict=False: fail2ban accepts a non-canonical network. OpenSSH does
+    # not. Each entry is written into AllowUsers verbatim rather than
+    # normalized, so accepting 10.10.10.100/24 here would emit a pattern sshd
+    # refuses to match and lock the operator out of a VM that validated.
+    for network in values["SSHD_ALLOW_IPS"].split():
+        try:
+            ipaddress.ip_network(network)
+        except ValueError as error:
+            canonical = None
+            try:
+                canonical = ipaddress.ip_network(network, strict=False)
+            except ValueError:
+                pass
+            hint = f"; use {canonical}" if canonical is not None else ""
+            raise ValueError(
+                f"{CONFIG_FILE}: SSHD_ALLOW_IPS entry {network} is not an address "
+                f"or network address{hint}"
+            ) from error
 
     if not re.fullmatch(r"0x[0-9A-Fa-f]{16}", values["APPDATA_WWN"]):
         raise ValueError(
@@ -234,6 +280,22 @@ def render(profile: Profile) -> str:
         "@@APPDATA_WWN@@": SITE["APPDATA_WWN"],
         "@@APPDATA_SERIAL@@": SITE["APPDATA_SERIAL"],
     }
+    # Placeholders that own their whole line and expand to any number of lines,
+    # keeping the indentation of the line they replace. An empty list drops the
+    # line entirely, which is how a blank optional setting emits no directive at
+    # all rather than an empty one.
+    sshd_allow_ips = SITE["SSHD_ALLOW_IPS"].split()
+    line_expansions = {
+        "@@SSHD_ALLOW_USERS@@": (
+            ["AllowUsers " + " ".join(f"admin@{source}" for source in sshd_allow_ips)]
+            if sshd_allow_ips
+            else []
+        ),
+    }
+    if profile.docker:
+        line_expansions["@@DOCKER_GPG_KEY@@"] = DOCKER_KEY.read_text(
+            encoding="utf-8"
+        ).splitlines()
     output: list[str] = []
     active_stack = [True]
 
@@ -241,9 +303,15 @@ def render(profile: Profile) -> str:
         directive = raw_line.strip()
         if directive.startswith("#% if "):
             flag = directive.removeprefix("#% if ").strip()
+            # "#% if !syslog" is how a block says "this profile, but not that
+            # variant of it". Nesting already works, so a negation is all that
+            # was missing to express docker-without-syslog.
+            negated = flag.startswith("!")
+            if negated:
+                flag = flag.removeprefix("!").strip()
             if flag not in flags:
                 raise ValueError(f"Unknown template flag: {flag}")
-            active_stack.append(active_stack[-1] and flags[flag])
+            active_stack.append(active_stack[-1] and (flags[flag] != negated))
             continue
         if directive == "#% endif":
             if len(active_stack) == 1:
@@ -256,11 +324,15 @@ def render(profile: Profile) -> str:
         line = raw_line
         for placeholder, value in replacements.items():
             line = line.replace(placeholder, value)
-        if "@@DOCKER_GPG_KEY@@" in line:
-            prefix = line[: line.index("@@DOCKER_GPG_KEY@@")]
+        expansion = next(
+            (name for name in line_expansions if name in line),
+            None,
+        )
+        if expansion is not None:
+            prefix = line[: line.index(expansion)]
             output.extend(
-                f"{prefix}{key_line}" if key_line else prefix.rstrip()
-                for key_line in DOCKER_KEY.read_text(encoding="utf-8").splitlines()
+                f"{prefix}{expanded}" if expanded else prefix.rstrip()
+                for expanded in line_expansions[expansion]
             )
         else:
             unresolved = re.findall(r"@@[A-Z0-9_]+@@", line)
