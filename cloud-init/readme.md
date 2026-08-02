@@ -20,7 +20,9 @@ Syslog variants send logs over unencrypted TCP, so use them only on a trusted or
 
 Syslog variants also keep logging entirely in RAM: `/var/log` is a tmpfs, the
 journal is volatile, and the forwarding queue is memory-only. Your collector is
-the only durable copy. See "RAM-only logging" below for the tradeoffs.
+the only durable copy. This starts after the reboot that ends first-boot
+bootstrap, not during first boot itself. See "RAM-only logging" below for the
+tradeoffs.
 
 ## What's inside the templates
 
@@ -45,6 +47,7 @@ configured.
 | User | `admin` username and SSH key supplied through Proxmox-generated user-data using `ciuser` and `sshkeys`; policy verified during first-boot finalization | `qm create --ciuser --sshkeys` |
 | Hostname | Generated from the current Proxmox VM name, including after cloning and renaming | Proxmox-generated user-data |
 | SSH | Public key only, no root login, `MaxAuthTries 3`, `LoginGraceTime 30s` | `/etc/ssh/sshd_config.d/99-harden.conf` |
+| SSH sources | `AllowUsers admin@...` built from `SSHD_ALLOW_IPS`; blank allows any source. Rejected at authentication, not at the packet level, so other sources still reach sshd and land in the fail2ban jail | `/etc/ssh/sshd_config.d/99-harden.conf` |
 | fail2ban | Aggressive `sshd` jail, 30m escalating bans, nftables actions, allow list from `FAIL2BAN_IGNORE_IPS` | `/etc/fail2ban/jail.local` |
 | Kernel | Restricted kptr and ptrace, unprivileged BPF off, ICMP redirects off, strict `rp_filter`, SYN cookies | `/etc/sysctl.d/20-hardening.conf` |
 | Updates | Unattended security upgrades, no automatic reboot | `/etc/apt/apt.conf.d/20auto-upgrades`, `52unattended-upgrades-local` |
@@ -53,22 +56,30 @@ configured.
 | Time | Timezone `America/Chicago` | cloud-init `timezone` |
 | APPDATA (Docker) | Disk checked by WWN and serial, ext4 labelled `APPDATA`, mounted at `/mnt/appdata`; Docker will not start without it | `appdata-verify.service` |
 | Docker | `data-root` on `/mnt/appdata/docker`, journald log driver, live restore, `admin` in the `docker` group | `/etc/docker/daemon.json` |
+| containerd (Docker) | `root` on `/mnt/appdata/containerd`, CRI plugin off. Docker's `data-root` does not move containerd's image and snapshot store, and the containerd image store is the Docker Engine 29 default, so without this the root disk fills up | `/etc/containerd/config.toml` |
 | Syslog | Volatile journal (64M), read at up to 25,000 messages per 60 seconds, and forwarded to `SYSLOG_SERVER:SYSLOG_PORT` over plain TCP with a memory-only queue and no local `/var/log` copy | `/etc/rsyslog.d/01-remote.conf` |
 | RAM-only logging (syslog) | `/var/log` on a 128M tmpfs, fail2ban logging to the journal with its ban database in `/run` | `var-log.mount`, `/etc/fail2ban/fail2ban.local` |
-| First boot | Self-checks the whole bootstrap, writes logs to `/home/admin/logs/`, then powers off; a failed boot stays running | `cloud-init-post-verify.service` |
+| First boot | Self-checks the whole bootstrap, writes logs to `/home/admin/logs/`, then reboots once and comes back up running; a failed boot stays up without rebooting so you can inspect it | `cloud-init-post-verify.service` |
 
-Site-specific values such as `SYSLOG_SERVER`, `SYSLOG_PORT`,
-`FAIL2BAN_IGNORE_IPS`, `APPDATA_WWN`, and `APPDATA_SERIAL` come from
-`tools/.env`. `templates/deb_13.yml.tmpl` is the authority if this summary ever
-falls behind.
+Site-specific values such as `VLAN_TAG`, `SYSLOG_SERVER`, `SYSLOG_PORT`,
+`FAIL2BAN_IGNORE_IPS`, `SSHD_ALLOW_IPS`, `APPDATA_WWN`, and `APPDATA_SERIAL` come
+from `tools/.env`. `templates/deb_13.yml.tmpl` is the authority if this summary
+ever falls behind.
 
 ### RAM-only logging (syslog variants)
 
-A VM cloned from a syslog template never writes a log to its disk. `/var/log` is
-a tmpfs mounted from `local-fs.target`, before cloud-init runs, so even
-cloud-init's own log lands in RAM. The journal is volatile, the rsyslog
-forwarding queue has no disk spool, and fail2ban logs to the journal instead of
-a file. Nothing swaps to disk either: the only swap device is zram.
+Once it is running normally, a VM cloned from a syslog template never writes a
+log to its disk. `/var/log` is a tmpfs mounted from `local-fs.target`, before
+cloud-init runs. The journal is volatile, the rsyslog forwarding queue has no
+disk spool, and fail2ban logs to the journal instead of a file. Nothing swaps to
+disk either: the only swap device is zram.
+
+**This does not apply to first boot.** Bootstrap can only *enable*
+`var-log.mount`, not start it, because starting it would shadow the `/var/log`
+cloud-init is still writing into. So for the whole of a clone's first boot
+`/var/log` is the real disk, and the tmpfs takes over on the next boot. That is
+why bootstrap reboots itself once when it succeeds. A *failed* first boot does
+not reboot, which is exactly what leaves its logs on disk for you to read.
 
 What you give up:
 
@@ -82,11 +93,9 @@ What you give up:
 - **fail2ban forgets its bans on reboot.** The ban database lives in `/run`.
   Bans do survive a fail2ban restart.
 
-Two things stay on disk on purpose. `/home/admin/logs/` is written once by the
-first-boot bootstrap report and is how you debug a failed first boot. And the
-template build boot itself writes `/var/log` normally, before the mount is
-enabled — those files stay in the template image, shadowed and unused on every
-clone.
+One thing stays on disk on purpose: `/home/admin/logs/` is written once by the
+first-boot bootstrap report, and is how you debug a failed first boot. It lives
+under `/home`, so the tmpfs never shadows it.
 
 ## Basic logic of the repo
 
@@ -118,9 +127,11 @@ chmod 0600 cloud-init/tools/.env
 nano cloud-init/tools/.env
 ```
 
-Review the VM IDs, name prefix, SSH public key, network bridge,
-storage names, and Proxmox paths. `VMID_START` must begin a range of four unused
-VM IDs.
+Review the VM IDs, name prefix, SSH public key, network bridge, storage names,
+and Proxmox paths. `VMID_START` must begin a range of four unused VM IDs. Set
+`VLAN_TAG` if your bridge is a trunk, and put your own workstation in
+`SSHD_ALLOW_IPS` before building, or you will not be able to log in. Both of
+those are optional: leave either blank for no VLAN and no source restriction.
 
 Validate the configuration and templates:
 
@@ -188,8 +199,10 @@ unused, and creates the selected Proxmox template. Keep the generated YAML
 snippets available to Proxmox so its cloud-init drive can be regenerated.
 
 
-A successful first boot records diagnostics and powers off. A failed first boot
-stays running so it can be inspected from the Proxmox console.
+A successful first boot records diagnostics and then reboots once, coming back up
+ready to use. The reboot is what puts the RAM-only logging mount in place on the
+syslog variants. A failed first boot does not reboot; it stays running, with its
+logs still on disk, so it can be inspected from the Proxmox console.
 
 ## To Do List
 

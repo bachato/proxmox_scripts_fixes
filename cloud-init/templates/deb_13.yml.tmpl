@@ -106,6 +106,7 @@ write_files:
       LoginGraceTime 30s
       MaxSessions 5
       MaxStartups 10:30:100
+      @@SSHD_ALLOW_USERS@@
 
   - path: /etc/sysctl.d/20-hardening.conf
     owner: root:root
@@ -219,6 +220,19 @@ write_files:
       Requires=appdata-verify.service
       After=appdata-verify.service
 
+  # containerd.service starts on its own and ahead of docker.service, so the
+  # drop-in above does not cover it. Without this, containerd can start before
+  # APPDATA is mounted and write its store to /mnt/appdata/containerd on the
+  # root disk, which is the failure this whole arrangement exists to prevent.
+  - path: /etc/systemd/system/containerd.service.d/10-require-appdata.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      RequiresMountsFor=/mnt/appdata
+      Requires=appdata-verify.service
+      After=appdata-verify.service
+
   - path: /usr/local/sbin/appdata-verify
     owner: root:root
     permissions: "0755"
@@ -286,6 +300,7 @@ write_files:
       [Unit]
       Description=Verify APPDATA disk identity before Docker starts
       RequiresMountsFor=/mnt/appdata
+      Before=containerd.service
       Before=docker.service
 
       [Service]
@@ -309,6 +324,29 @@ write_files:
         "data-root": "/mnt/appdata/docker",
         "live-restore": true
       }
+
+  # Docker's data-root does not move containerd's image and snapshot store.
+  # Docker Engine 29 defaults to the containerd image store, so leaving
+  # containerd on /var/lib/containerd fills the root disk no matter where
+  # data-root points. cloud-init writes this before containerd.io installs, and
+  # it runs apt with --force-confold, so dpkg keeps this file over the packaged
+  # one.
+  - path: /etc/containerd/config.toml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      # Keep version 2. Version 3 is a hard failure on containerd 1.7, which is
+      # what Debian ships and what CI validates against; 2 is accepted by both
+      # that and the containerd 2.x in containerd.io.
+      version = 2
+      root = "/mnt/appdata/containerd"
+      state = "/run/containerd"
+      # Docker does not use the CRI plugin, and replacing the packaged config
+      # would otherwise silently re-enable it. The packaged file writes this as
+      # "cri", which works only because it declares no version and so parses as
+      # a version 1 config. Under version 2 both containerd 1.7 and 2.x reject
+      # the short name and refuse to start, so the full plugin URI is required.
+      disabled_plugins = ["io.containerd.grpc.v1.cri"]
 #% endif
 
 #% if syslog
@@ -567,8 +605,14 @@ write_files:
 
       /usr/local/sbin/cloud-init-report success 0 0
       touch "$success_marker"
-      /usr/sbin/shutdown --poweroff +1 \
-        "cloud-init validated successfully; shutting down"
+      # Bootstrap enables var-log.mount but cannot start it: doing so would
+      # shadow the /var/log cloud-init is still writing into. Only a boot puts
+      # the tmpfs in place, and nothing else would ever trigger one now that a
+      # successful first boot leaves the VM running. The success marker is
+      # already on disk, so the post-verify unit's ConditionPathExists skips it
+      # on the way back up rather than looping.
+      /usr/sbin/shutdown --reboot +1 \
+        "cloud-init validated successfully; rebooting"
       trap - ERR
 
   - path: /etc/systemd/system/cloud-init-post-verify.service
@@ -714,12 +758,53 @@ write_files:
 #% if docker
       systemctl start appdata-verify.service
       systemctl is-active --quiet appdata-verify.service
+
+      install -d -m 0711 /mnt/appdata/containerd
       install -d -m 0710 /mnt/appdata/docker
+
+      # An unmounted /mnt/appdata accepts both directories just as happily; they
+      # would simply be on the root disk. Prove they resolve onto the mount.
+      for appdata_dir in /mnt/appdata/containerd /mnt/appdata/docker; do
+        [ "$(findmnt -no TARGET --target "$appdata_dir")" = /mnt/appdata ] || {
+          echo "$appdata_dir is not on the APPDATA mount" >&2
+          on_error 1 "$LINENO"
+        }
+      done
+
+      # config dump reports the merged, effective configuration rather than just
+      # the file written above. Parse it as TOML instead of matching on quotes:
+      # containerd 1.7 renders these values with " and 2.x with '.
+      containerd config dump | /usr/bin/python3 -c '
+      import sys
+      import tomllib
+
+      expected = {"root": "/mnt/appdata/containerd", "state": "/run/containerd"}
+      config = tomllib.loads(sys.stdin.read())
+      for key, want in expected.items():
+          got = config.get(key)
+          if got != want:
+              raise SystemExit(f"containerd {key} is {got!r}, expected {want!r}")
+      ' || on_error 1 "$LINENO"
+
+      systemctl restart containerd.service
+      systemctl is-active --quiet containerd.service
+
       /usr/bin/dockerd --validate --config-file /etc/docker/daemon.json
       usermod -aG docker admin
       systemctl enable --now docker.service
       systemctl is-active --quiet docker.service
       timeout 30 docker info >/dev/null
+
+      # containerd creates its plugin directories under root on start. Testing
+      # for content rather than a named plugin path survives version changes.
+      [ -n "$(ls -A /mnt/appdata/containerd)" ] || {
+        echo "containerd did not populate /mnt/appdata/containerd" >&2
+        on_error 1 "$LINENO"
+      }
+      if [ -d /var/lib/containerd ] && [ -n "$(ls -A /var/lib/containerd)" ]; then
+        echo "containerd wrote to the root disk at /var/lib/containerd" >&2
+        on_error 1 "$LINENO"
+      fi
 #% endif
 
 #% if syslog
