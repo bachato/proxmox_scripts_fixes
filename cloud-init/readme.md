@@ -94,7 +94,7 @@ clone.
 | --- | --- |
 | `tools/.env` | Your local settings, copied from `tools/.env.example` and ignored by Git. Create this! |
 | `templates/` | Shared cloud-init, Proxmox user-data, and creation-script templates. You don't need to access. |
-| `tools/render_profiles.py` | Renders the template variations. You don't need to access |
+| `tools/render_profiles.py` | Renders the template variations in memory. You don't need to access |
 | `tools/build_template_bundle.py` | Validates the inputs and builds the Proxmox files. You don't need to access |
 | `tools/create_proxmox_template.sh` | Main build command.  Run this to build the templates! |
 | `build/` | Generated YAML and Proxmox creation scripts; ignored by Git. This is where your generated cloud-init files will live. |
@@ -140,35 +140,47 @@ scripts. Building does not change templates that already exist in Proxmox.
 
 ## Install Step #2: add template on Proxmox
 
+The snippets go in the storage named by `SNIPPET_STORAGE_NAME` in
+`cloud-init/tools/.env`. 
+
+You can check the location on proxmox with:
+
+```bash
+pvesm path local:snippets/x
+```
+
+That prints the path the file `x` would have; drop the trailing `/x` and you
+have the snippets directory. Use your own storage name in place of `local`.
+
 ### If you do not have SSH keys setup (Manually copy files)
 
-Copy all eight files from `cloud-init/build/` to the Proxmox snippets folder set
-by `PROXMOX_SNIPPET_PATH` in `cloud-init/tools/.env`.
+Copy all eight files from `cloud-init/build/` into that snippets directory.
 
 ### If you have SSH keys setup
 
 From the repository root on the build machine, set your Proxmox hostname and
-copy the generated bundle:
+storage name, then copy the generated bundle:
 
 ```bash
 PROXMOX_HOST=pve.example.com
-PROXMOX_SNIPPET_PATH=/mnt/pve/cloud-init/snippets
+SNIPPET_STORAGE_NAME=local
 
-scp cloud-init/build/* "root@${PROXMOX_HOST}:${PROXMOX_SNIPPET_PATH}/"
+SNIPPET_DIR="$(ssh "root@${PROXMOX_HOST}" pvesm path "${SNIPPET_STORAGE_NAME}:snippets/x")"
+SNIPPET_DIR="${SNIPPET_DIR%/x}"
+
+scp cloud-init/build/* "root@${PROXMOX_HOST}:${SNIPPET_DIR}/"
 ssh "root@${PROXMOX_HOST}"
 ```
 
-The commands below use `/mnt/pve/cloud-init/snippets`. Replace that path if
-your `PROXMOX_SNIPPET_PATH` setting is different.
-
-On the Proxmox host, run the script for each template you want:
+On the Proxmox host, change into the snippets directory you found above, then
+run the script for each template you want:
 
 | Template | Command |
 | --- | --- |
-| Plain | `bash /snippets/create-deb13-plain-template.sh` |
-| Plain + syslog | `bash /snippets/create-deb13-plain-syslog-template.sh` |
-| Docker | `bash /snippets/create-deb13-docker-template.sh` |
-| Docker + syslog | `bash /snippets/create-deb13-docker-syslog-template.sh` |
+| Plain | `bash create-deb13-plain-template.sh` |
+| Plain + syslog | `bash create-deb13-plain-syslog-template.sh` |
+| Docker | `bash create-deb13-docker-template.sh` |
+| Docker + syslog | `bash create-deb13-docker-syslog-template.sh` |
 
 
 The script downloads and verifies the Debian image, confirms the VM ID is

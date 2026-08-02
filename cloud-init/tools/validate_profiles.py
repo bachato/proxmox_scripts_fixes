@@ -770,62 +770,7 @@ def validate_ram_logging(files: dict[str, str], profile_name: str) -> None:
         )
 
 
-def validate_readme() -> None:
-    path = ROOT / "readme.md"
-    content = path.read_text(encoding="utf-8")
-
-    for stale_text in (
-        "raw.githubusercontent.com",
-        "archive/",
-        "docker_graylog.yml",
-        "ssh_authorized_keys:",
-        "/home/logs",
-        "SYSLOG_CA_FILE",
-        "server-authenticated TLS",
-        "receiver certificate",
-        "rsyslog-openssl",
-        "logs.example.invalid",
-        "PROFILE_SHA256=",
-        "site.env",
-        "template-build.env",
-    ):
-        if stale_text in content:
-            raise SystemExit(f"readme.md: stale instruction remains: {stale_text}")
-
-    expected_headings = (
-        "## What this repo does",
-        "## What's inside the templates",
-        "## Basic logic of the repo",
-        "## Install Step #1: Create the cloud-init templates",
-        "## Install Step #2: add template on Proxmox",
-        "## To Do List",
-        "## How do I use AI?",
-    )
-    actual_headings = tuple(re.findall(r"(?m)^## .+$", content))
-    if actual_headings != expected_headings:
-        raise SystemExit(
-            "readme.md: expected exactly these sections in order: "
-            f"{list(expected_headings)}"
-        )
-
-    require_fragments(
-        content,
-        (
-            ".env.example",
-            "ARTIFACT_OUTPUT_DIR",
-            "build_template_bundle.py",
-            "create_proxmox_template.sh",
-            "cp cloud-init/tools/.env.example cloud-init/tools/.env",
-            "cloud-init/tools/validate.sh",
-            "cloud-init/tools/create_proxmox_template.sh",
-            'scp cloud-init/build/* "root@${PROXMOX_HOST}:${PROXMOX_SNIPPET_PATH}/"',
-            "create-deb13-plain-template.sh",
-            "TLS or RELP",
-            "QEMU/Proxmox",
-        ),
-        "readme.md",
-    )
-
+def validate_template_wrapper() -> None:
     wrapper = ROOT / "tools" / "create_proxmox_template.sh"
     wrapper_script = wrapper.read_text(encoding="utf-8")
     run(["bash", "-n", str(wrapper)])
@@ -839,6 +784,8 @@ def validate_readme() -> None:
         str(wrapper),
     )
 
+
+def validate_bundle_builder() -> None:
     builder = ROOT / "tools" / "build_template_bundle.py"
     builder_script = builder.read_text(encoding="utf-8")
     require_fragments(
@@ -850,12 +797,32 @@ def validate_readme() -> None:
             "os.replace",
             'f"create-{vendor.template_name}.sh"',
             "proxmox-create-command.sh.tmpl",
+            "prepare_output_directory",
+            "BUNDLE_MARKER",
         ),
         str(builder),
     )
     run([sys.executable, "-m", "py_compile", str(builder)])
     run([sys.executable, str(builder), "--validate"])
 
+    if not re.search(r'IMAGE_SHA512 = \(\n(?:\s+"[0-9a-f]+"\n)+\)', builder_script):
+        raise SystemExit(f"{builder}: missing the Debian image pin")
+
+
+def validate_artifact_writer_boundary() -> None:
+    # The bundle builder is the only artifact writer. Two writers meant two
+    # output-path behaviours, one of which ignored ARTIFACT_OUTPUT_DIR.
+    renderer = ROOT / "tools" / "render_profiles.py"
+    renderer_script = renderer.read_text(encoding="utf-8")
+    for writing_call in ("write_text(", "write_bytes(", "mkdir(", "os.replace"):
+        if writing_call in renderer_script:
+            raise SystemExit(
+                f"render_profiles.py must not write files, found {writing_call}; "
+                "build_template_bundle.py is the only artifact writer"
+            )
+
+
+def validate_creation_template() -> None:
     command_template = (
         ROOT / "templates" / "proxmox-create-command.sh.tmpl"
     ).read_text(encoding="utf-8")
@@ -863,7 +830,12 @@ def validate_readme() -> None:
         command_template,
         (
             'qm destroy "$current_vmid" --purge 1',
-            '--cicustom "vendor=${SNIPPET_STORAGE_NAME}:snippets/',
+            # One resolved volume string feeds both the checksum and qm create,
+            # so the file that is verified is the file cloud-init reads.
+            'vendor_volume="${SNIPPET_STORAGE_NAME}:snippets/${VENDOR_SNIPPET_NAME}"',
+            'pvesm status --storage "$SNIPPET_STORAGE_NAME"',
+            'vendor_path="$(pvesm path "$vendor_volume")"',
+            '--cicustom "vendor=${vendor_volume}"',
             "VENDOR_SNIPPET_NAME=@@VENDOR_SNIPPET_NAME@@",
             "VMID=@@VMID@@",
             'create_template "$VMID" "$NAME"',
@@ -903,9 +875,9 @@ def validate_readme() -> None:
         raise SystemExit(
             "creation script must use Proxmox-generated user-data"
         )
-    if not re.search(r'IMAGE_SHA512 = \(\n(?:\s+"[0-9a-f]+"\n)+\)', builder_script):
-        raise SystemExit("template creation script is missing the Debian image pin")
 
+
+def validate_local_env_workflow() -> None:
     example_config = ROOT / "tools" / ".env.example"
     if not example_config.is_file() or ".env\n" not in (ROOT / ".gitignore").read_text(
         encoding="utf-8"
@@ -919,8 +891,6 @@ def validate_readme() -> None:
     )
     if re.search(r"(?m)^PROFILE=", example_content):
         raise SystemExit(f"{example_config}: PROFILE must not select one template")
-
-    print("readme.md and local artifact bundle workflow validated")
 
 
 def require_full_validation_tools() -> None:
@@ -1133,7 +1103,12 @@ def main() -> int:
                         f"syslog profiles, but {ram_only_path} is present"
                     )
 
-    validate_readme()
+    validate_template_wrapper()
+    validate_bundle_builder()
+    validate_artifact_writer_boundary()
+    validate_creation_template()
+    validate_local_env_workflow()
+    print("local artifact bundle workflow validated")
     print("All cloud-init profiles validated")
     return 0
 

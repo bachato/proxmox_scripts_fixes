@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
 import ipaddress
 import os
@@ -33,7 +32,6 @@ BUILD_KEYS = {
     "SSH_PUBLIC_KEY_FILE",
     "ARTIFACT_OUTPUT_DIR",
     "SNIPPET_STORAGE_NAME",
-    "PROXMOX_SNIPPET_PATH",
     "ISO_STORAGE_PATH",
     "VM_STORAGE_NAME",
     "CPU",
@@ -43,6 +41,16 @@ BUILD_KEYS = {
     "APPDATA_DISK_SIZE",
 }
 CONFIG_KEYS = SITE_KEYS | BUILD_KEYS
+
+# Keys that used to be required. A live .env is not tracked by Git, so an
+# operator upgrading the repo still has these; say what replaced them instead
+# of reporting a bare unknown key.
+REMOVED_KEYS = {
+    "PROXMOX_SNIPPET_PATH": (
+        "snippet paths now come from the Proxmox storage API; "
+        "SNIPPET_STORAGE_NAME is the only snippet setting"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -123,6 +131,11 @@ def load_config() -> dict[str, str]:
         if not match:
             raise ValueError(f"{CONFIG_FILE}:{line_number}: expected KEY=value")
         key, raw_value = match.groups()
+        if key in REMOVED_KEYS:
+            raise ValueError(
+                f"{CONFIG_FILE}:{line_number}: {key} was removed; "
+                f"{REMOVED_KEYS[key]}. Delete the line."
+            )
         if key not in CONFIG_KEYS:
             raise ValueError(f"{CONFIG_FILE}:{line_number}: unknown key {key}")
         if key in values:
@@ -180,12 +193,8 @@ def load_config() -> dict[str, str]:
     for key in ("SNIPPET_STORAGE_NAME", "VM_STORAGE_NAME"):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", values[key]):
             raise ValueError(f"{CONFIG_FILE}: {key} contains unsupported characters")
-    for key in (
-        "PROXMOX_SNIPPET_PATH",
-        "ISO_STORAGE_PATH",
-    ):
-        if not Path(values[key]).expanduser().is_absolute():
-            raise ValueError(f"{CONFIG_FILE}: {key} must be an absolute path")
+    if not Path(values["ISO_STORAGE_PATH"]).expanduser().is_absolute():
+        raise ValueError(f"{CONFIG_FILE}: ISO_STORAGE_PATH must be an absolute path")
     for key in (
         "VMID_START",
         "CPU",
@@ -204,7 +213,14 @@ def load_config() -> dict[str, str]:
     return values
 
 
-CONFIG = load_config()
+# Importers read CONFIG at module scope, so a bad .env surfaces here. Exit on
+# the message rather than letting a traceback bury it: a misconfigured file is
+# the operator's problem to fix, not a bug to report.
+try:
+    CONFIG = load_config()
+except ValueError as error:
+    raise SystemExit(f"ERROR: {error}") from None
+
 SITE = {key: CONFIG[key] for key in SITE_KEYS}
 
 
@@ -264,30 +280,17 @@ def render(profile: Profile) -> str:
     return "\n".join(compacted).rstrip() + "\n"
 
 
-def check_or_write(check: bool) -> int:
-    output_directory = ROOT / "build"
-    if not check:
-        output_directory.mkdir(parents=True, exist_ok=True)
-    for profile in PROFILES:
-        expected = render(profile)
-        if check:
-            print(f"rendered in memory: {profile.output}")
-        else:
-            destination = output_directory / profile.output
-            destination.write_text(expected, encoding="utf-8")
-            print(f"rendered {destination.relative_to(ROOT.parent)}")
-    return 0
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="render every profile in memory without writing preview files",
-    )
-    args = parser.parse_args()
-    return check_or_write(args.check)
+    """Render every profile in memory as a smoke test.
+
+    This module never writes a file. build_template_bundle.py is the only
+    artifact writer, so there is exactly one place that decides where
+    generated files land.
+    """
+    for profile in PROFILES:
+        render(profile)
+        print(f"rendered in memory: {profile.output}")
+    return 0
 
 
 if __name__ == "__main__":

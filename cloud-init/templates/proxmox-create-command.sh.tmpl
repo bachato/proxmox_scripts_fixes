@@ -11,7 +11,6 @@ MEM_MAX=@@MEM_MAX@@
 BRIDGE=@@BRIDGE@@
 VM_STORAGE_NAME=@@VM_STORAGE_NAME@@
 SNIPPET_STORAGE_NAME=@@SNIPPET_STORAGE_NAME@@
-PROXMOX_SNIPPET_PATH=@@PROXMOX_SNIPPET_PATH@@
 ISO_STORAGE_PATH=@@ISO_STORAGE_PATH@@
 ROOT_DISK_SIZE=@@ROOT_DISK_SIZE@@
 APPDATA_DISK_SIZE=@@APPDATA_DISK_SIZE@@
@@ -37,16 +36,25 @@ require_command() {
 }
 
 [ "$(id -u)" -eq 0 ] || fail "Run these commands as root on Proxmox"
-for command in awk curl mktemp mv qm sha256sum sha512sum ssh-keygen; do
+for command in awk curl mktemp mv pvesm qm sha256sum sha512sum ssh-keygen; do
   require_command "$command"
 done
 
-[ -d "$PROXMOX_SNIPPET_PATH" ] || \
-  fail "Proxmox snippet directory is missing: $PROXMOX_SNIPPET_PATH"
 [ -d "$ISO_STORAGE_PATH" ] || \
   fail "Proxmox ISO directory is missing: $ISO_STORAGE_PATH"
 
-vendor_path="${PROXMOX_SNIPPET_PATH}/${VENDOR_SNIPPET_NAME}"
+# The storage is the only authority for where snippets live. Resolving the
+# volume here means the file verified below is the file qm create reads.
+vendor_volume="${SNIPPET_STORAGE_NAME}:snippets/${VENDOR_SNIPPET_NAME}"
+pvesm status --storage "$SNIPPET_STORAGE_NAME" >/dev/null 2>&1 || \
+  fail "Proxmox storage is missing or inactive: $SNIPPET_STORAGE_NAME"
+vendor_path="$(pvesm path "$vendor_volume")" || \
+  fail "Could not resolve $vendor_volume; does $SNIPPET_STORAGE_NAME allow snippets?"
+case "$vendor_path" in
+  /*) ;;
+  *) fail "pvesm returned an unexpected path for $vendor_volume: $vendor_path" ;;
+esac
+
 [ -r "$vendor_path" ] || fail "Vendor snippet is missing: $vendor_path"
 printf '%s  %s\n' "$VENDOR_SHA256" "$vendor_path" | sha256sum --check -
 
@@ -102,8 +110,7 @@ ssh-keygen -l -f "$ssh_key_file" >/dev/null
 create_template() {
   local vmid="$1"
   local name="$2"
-  local vendor_snippet_name="$3"
-  local needs_appdata="$4"
+  local needs_appdata="$3"
   local root_volume
 
   current_vmid="$vmid"
@@ -118,7 +125,7 @@ create_template() {
     --scsihw virtio-scsi-single \
     --serial0 socket \
     --vga serial0 \
-    --cicustom "vendor=${SNIPPET_STORAGE_NAME}:snippets/${vendor_snippet_name}" \
+    --cicustom "vendor=${vendor_volume}" \
     --ciuser admin \
     --sshkeys "$ssh_key_file" \
     --ciupgrade 0 \
@@ -170,6 +177,6 @@ create_template() {
   echo "Created Proxmox template $vmid ($name)"
 }
 
-create_template "$VMID" "$NAME" "$VENDOR_SNIPPET_NAME" "$NEEDS_APPDATA"
+create_template "$VMID" "$NAME" "$NEEDS_APPDATA"
 
 echo "Created Proxmox template $VMID ($NAME) successfully"
