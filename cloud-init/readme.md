@@ -15,7 +15,7 @@ SSH login, and installs security updates and the QEMU guest agent.
 | Docker | Yes | No | Yes |
 | Docker + syslog | Yes | Plain TCP | Yes |
 
-Docker variants add a dedicated APPDATA disk.
+Docker variants add a dedicated APPDATA disk. 
 Syslog variants send logs over unencrypted TCP, so use them only on a trusted or separately protected network.  (TLS in the future)
 
 Syslog variants also keep logging entirely in RAM: `/var/log` is a tmpfs, the
@@ -55,7 +55,7 @@ configured.
 | Disk | Root filesystem grows on first boot, `fstrim.timer` enabled | cloud-init `growpart` |
 | Time | Timezone `America/Chicago` | cloud-init `timezone` |
 | APPDATA (Docker) | Disk checked by WWN and serial, ext4 labelled `APPDATA`, mounted at `/mnt/appdata`; Docker will not start without it | `appdata-verify.service` |
-| Docker | `data-root` on `/mnt/appdata/docker`, journald log driver, live restore, `admin` in the `docker` group | `/etc/docker/daemon.json` |
+| Docker | `data-root` on `/mnt/appdata/docker`, live restore, `admin` in the `docker` group | `/etc/docker/daemon.json` | `/etc/docker/daemon.json` |
 | containerd (Docker) | `root` on `/mnt/appdata/containerd`, CRI plugin off. Docker's `data-root` does not move containerd's image and snapshot store, and the containerd image store is the Docker Engine 29 default, so without this the root disk fills up | `/etc/containerd/config.toml` |
 | Syslog | Volatile journal (64M), read at up to 25,000 messages per 60 seconds, and forwarded to `SYSLOG_SERVER:SYSLOG_PORT` over plain TCP with a memory-only queue and no local `/var/log` copy | `/etc/rsyslog.d/01-remote.conf` |
 | RAM-only logging (syslog) | `/var/log` on a 128M tmpfs, fail2ban logging to the journal with its ban database in `/run` | `var-log.mount`, `/etc/fail2ban/fail2ban.local` |

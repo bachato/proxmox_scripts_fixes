@@ -303,9 +303,15 @@ def render(profile: Profile) -> str:
         directive = raw_line.strip()
         if directive.startswith("#% if "):
             flag = directive.removeprefix("#% if ").strip()
+            # "#% if !syslog" is how a block says "this profile, but not that
+            # variant of it". Nesting already works, so a negation is all that
+            # was missing to express docker-without-syslog.
+            negated = flag.startswith("!")
+            if negated:
+                flag = flag.removeprefix("!").strip()
             if flag not in flags:
                 raise ValueError(f"Unknown template flag: {flag}")
-            active_stack.append(active_stack[-1] and flags[flag])
+            active_stack.append(active_stack[-1] and (flags[flag] != negated))
             continue
         if directive == "#% endif":
             if len(active_stack) == 1:

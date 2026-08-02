@@ -21,6 +21,10 @@ from render_profiles import PROFILES, ROOT, SITE, render
 
 
 CONTAINERD_CRI_PLUGIN = "io.containerd.grpc.v1.cri"
+# The only log drivers that write container logs under the daemon's data-root,
+# which is what puts them on APPDATA. Every other driver hands them to something
+# else, back on the root disk or in RAM.
+DATA_ROOT_LOG_DRIVERS = frozenset({"local", "json-file"})
 DOCKER_KEY_SHA256 = "1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570"
 DOCKER_KEY_FINGERPRINT = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
 SUCCESS_MARKER = "/var/lib/cloud/instance/boot-success"
@@ -582,6 +586,22 @@ def validate_common(
     )
 
 
+def root_disk_paths(value: object) -> list[str]:
+    """Every root-disk path anywhere in a parsed config, at any nesting depth.
+
+    Shared by the containerd and Docker checks: both exist to keep a store off
+    the small root partition, and both are one new key away from putting one
+    back there without any named check noticing.
+    """
+    if isinstance(value, str):
+        return [value] if value.startswith("/var/lib") else []
+    if isinstance(value, dict):
+        return [path for item in value.values() for path in root_disk_paths(item)]
+    if isinstance(value, list):
+        return [path for item in value for path in root_disk_paths(item)]
+    return []
+
+
 def validate_containerd(files: dict[str, str], profile_name: str) -> None:
     """containerd keeps its own store; Docker's data-root does not move it.
 
@@ -621,15 +641,6 @@ def validate_containerd(files: dict[str, str], profile_name: str) -> None:
 
     # Catches a future key that quietly points some other store back at the root
     # disk, which the two explicit checks above would not see.
-    def root_disk_paths(value: object) -> list[str]:
-        if isinstance(value, str):
-            return [value] if value.startswith("/var/lib") else []
-        if isinstance(value, dict):
-            return [path for item in value.values() for path in root_disk_paths(item)]
-        if isinstance(value, list):
-            return [path for item in value for path in root_disk_paths(item)]
-        return []
-
     on_root_disk = root_disk_paths(containerd_settings)
     if on_root_disk:
         raise SystemExit(
@@ -666,11 +677,67 @@ def validate_containerd(files: dict[str, str], profile_name: str) -> None:
     )
 
 
-def validate_docker(files: dict[str, str], profile_name: str) -> None:
+def validate_docker_logging(
+    daemon_settings: dict, profile_name: str, *, syslog: bool
+) -> None:
+    """Container logs follow the log driver, not data-root.
+
+    Moving the store to APPDATA did nothing for logs on its own: journald put
+    every container's output into the system journal on the root disk. The two
+    profiles resolve that differently, and each answer has a quiet way of being
+    undone, so both are pinned here rather than left to the template.
+    """
+    driver = daemon_settings.get("log-driver")
+    log_opts = daemon_settings.get("log-opts", {})
+    if not isinstance(log_opts, dict):
+        raise SystemExit(f"{profile_name}: daemon.json log-opts is not a mapping")
+
+    if syslog:
+        # imjournal is the only route container logs have to the collector, and
+        # /var/log is a tmpfs on this profile, so a file-based driver would
+        # write into RAM and lose everything on the next reboot.
+        if driver != "journald":
+            raise SystemExit(
+                f"{profile_name}: log driver is {driver!r}; the syslog profile "
+                "reaches the collector through the journal and must use journald"
+            )
+        return
+
+    if driver not in DATA_ROOT_LOG_DRIVERS:
+        raise SystemExit(
+            f"{profile_name}: log driver is {driver!r}, which does not write under "
+            "data-root, so container logs would not be on APPDATA; use one of "
+            f"{sorted(DATA_ROOT_LOG_DRIVERS)}"
+        )
+
+    # Uncapped logs on APPDATA only trade a full root disk for a full data disk.
+    # Neither driver rotates anything until it is given a limit.
+    missing = [option for option in ("max-size", "max-file") if not log_opts.get(option)]
+    if missing:
+        raise SystemExit(
+            f"{profile_name}: container logs on APPDATA are uncapped; "
+            f"daemon.json log-opts is missing {missing}"
+        )
+
+
+def validate_docker(
+    files: dict[str, str], profile_name: str, *, syslog: bool
+) -> None:
     daemon_config = files["/etc/docker/daemon.json"]
     daemon_settings = json.loads(daemon_config)
     if daemon_settings.get("data-root") != "/mnt/appdata/docker":
         raise SystemExit(f"{profile_name}: Docker data-root is not on APPDATA")
+
+    # Same failure as containerd's, one config file over: a key naming /var/lib
+    # puts a store back on the root disk and no named check above would see it.
+    on_root_disk = root_disk_paths(daemon_settings)
+    if on_root_disk:
+        raise SystemExit(
+            f"{profile_name}: daemon.json names root-disk paths: {on_root_disk}"
+        )
+
+    validate_docker_logging(daemon_settings, profile_name, syslog=syslog)
+
     if FULL_VALIDATION:
         print(f"dockerd --validate {profile_name}")
         run(
@@ -1139,7 +1206,7 @@ def main() -> int:
             validate_shell(files[script_path], f"{profile.output}:{script_path}", "bash")
 
         if profile.docker:
-            validate_docker(files, profile.output)
+            validate_docker(files, profile.output, syslog=profile.syslog)
             if "mounts" not in config or "bootcmd" not in config:
                 raise SystemExit(f"{profile.output}: APPDATA provisioning is missing")
             expected_link = f'/dev/disk/by-id/wwn-{SITE["APPDATA_WWN"]}'
@@ -1213,9 +1280,33 @@ def main() -> int:
                     "systemctl is-active --quiet containerd.service",
                     '[ -n "$(ls -A /mnt/appdata/containerd)" ]',
                     "containerd wrote to the root disk at /var/lib/containerd",
+                    # Container logs are written under the daemon's root
+                    # directory, so asserting daemon.json is not enough: read
+                    # the effective values back off the running daemon.
+                    "docker info --format '{{.DockerRootDir}}'",
+                    "docker info --format '{{.LoggingDriver}}'",
+                    '[ "$docker_root" = /mnt/appdata/docker ]',
                 ),
                 profile.output,
             )
+            expected_driver = "journald" if profile.syslog else "local"
+            if f'[ "$log_driver" = {expected_driver} ]' not in finalizer:
+                raise SystemExit(
+                    f"{profile.output}: finalizer does not prove the running "
+                    f"daemon uses the {expected_driver} log driver"
+                )
+            if not profile.syslog:
+                # dockerd creates containers/ on start and the local driver puts
+                # each container's log inside it. An unmounted /mnt/appdata would
+                # take that directory on the root disk without complaint.
+                require_fragments(
+                    finalizer,
+                    (
+                        "findmnt -no TARGET --target /mnt/appdata/docker/containers",
+                        "Docker container logs are not on the APPDATA mount",
+                    ),
+                    profile.output,
+                )
         else:
             if "mounts" in config or "bootcmd" in config:
                 raise SystemExit(f"{profile.output}: plain profiles must not format APPDATA")

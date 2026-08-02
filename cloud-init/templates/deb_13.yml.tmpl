@@ -308,17 +308,40 @@ write_files:
       ExecStart=/usr/local/sbin/appdata-verify
       RemainAfterExit=yes
 
+  # Container logs follow the log driver, not data-root, so moving the store
+  # alone left them behind. The two profiles need different answers, and only
+  # the log-driver and log-opts lines differ: everything else is shared so the
+  # two cannot drift apart.
+  #
+  # No syslog: the local driver writes under data-root, which is already on
+  # APPDATA, so logs land on the right disk with no bind mount and no journald
+  # ordering to get wrong. It also rotates, which the journald path never did
+  # per container. The caps are per container, before compression.
+  #
+  # Syslog: keep journald. imjournal is the only path container logs have to
+  # the collector on that profile, and /var/log is a tmpfs there, so a
+  # file-based driver would write to RAM and vanish on reboot.
   - path: /etc/docker/daemon.json
     owner: root:root
     permissions: "0644"
     content: |
       {
+#% if syslog
         "log-driver": "journald",
         "log-opts": {
           "tag": "docker/{{.Name}}",
           "labels": "com.docker.compose.project,com.docker.compose.service",
           "env": "NODE_ENV,ROLE"
         },
+#% endif
+#% if !syslog
+        "log-driver": "local",
+        "log-opts": {
+          "max-size": "50m",
+          "max-file": "5",
+          "compress": "true"
+        },
+#% endif
         "max-concurrent-downloads": 24,
         "max-concurrent-uploads": 8,
         "data-root": "/mnt/appdata/docker",
@@ -794,6 +817,36 @@ write_files:
       systemctl enable --now docker.service
       systemctl is-active --quiet docker.service
       timeout 30 docker info >/dev/null
+
+      # daemon.json is what we asked for; read back what Docker actually did.
+      # Container logs are written under the daemon's root directory, so where
+      # they land is only as good as the effective data-root.
+      docker_root="$(timeout 30 docker info --format '{{.DockerRootDir}}')"
+      [ "$docker_root" = /mnt/appdata/docker ] || {
+        echo "Docker root is $docker_root, expected /mnt/appdata/docker" >&2
+        on_error 1 "$LINENO"
+      }
+      log_driver="$(timeout 30 docker info --format '{{.LoggingDriver}}')"
+#% if !syslog
+      [ "$log_driver" = local ] || {
+        echo "Docker log driver is $log_driver, expected local" >&2
+        on_error 1 "$LINENO"
+      }
+
+      # dockerd creates containers/ when it starts, and that is where the local
+      # driver puts each container's log. An unmounted /mnt/appdata would accept
+      # the directory on the root disk just as happily, so prove the resolution.
+      [ "$(findmnt -no TARGET --target /mnt/appdata/docker/containers)" = /mnt/appdata ] || {
+        echo "Docker container logs are not on the APPDATA mount" >&2
+        on_error 1 "$LINENO"
+      }
+#% endif
+#% if syslog
+      [ "$log_driver" = journald ] || {
+        echo "Docker log driver is $log_driver, expected journald" >&2
+        on_error 1 "$LINENO"
+      }
+#% endif
 
       # containerd creates its plugin directories under root on start. Testing
       # for content rather than a named plugin path survives version changes.
