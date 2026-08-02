@@ -39,6 +39,7 @@ BUILD_KEYS = {
     "CPU",
     "MEM_MIN",
     "MEM_MAX",
+    "ROOT_DISK_SIZE",
     "APPDATA_DISK_SIZE",
 }
 CONFIG_KEYS = SITE_KEYS | BUILD_KEYS
@@ -185,7 +186,14 @@ def load_config() -> dict[str, str]:
     ):
         if not Path(values[key]).expanduser().is_absolute():
             raise ValueError(f"{CONFIG_FILE}: {key} must be an absolute path")
-    for key in ("VMID_START", "CPU", "MEM_MIN", "MEM_MAX", "APPDATA_DISK_SIZE"):
+    for key in (
+        "VMID_START",
+        "CPU",
+        "MEM_MIN",
+        "MEM_MAX",
+        "ROOT_DISK_SIZE",
+        "APPDATA_DISK_SIZE",
+    ):
         if not values[key].isdigit() or int(values[key]) <= 0:
             raise ValueError(f"{CONFIG_FILE}: {key} must be a positive integer")
     if int(values["VMID_START"]) + len(PROFILES) - 1 > 999999999:

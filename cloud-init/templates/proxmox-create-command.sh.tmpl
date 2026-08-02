@@ -13,6 +13,7 @@ VM_STORAGE_NAME=@@VM_STORAGE_NAME@@
 SNIPPET_STORAGE_NAME=@@SNIPPET_STORAGE_NAME@@
 PROXMOX_SNIPPET_PATH=@@PROXMOX_SNIPPET_PATH@@
 ISO_STORAGE_PATH=@@ISO_STORAGE_PATH@@
+ROOT_DISK_SIZE=@@ROOT_DISK_SIZE@@
 APPDATA_DISK_SIZE=@@APPDATA_DISK_SIZE@@
 APPDATA_SERIAL=@@APPDATA_SERIAL@@
 APPDATA_WWN=@@APPDATA_WWN@@
@@ -136,6 +137,9 @@ create_template() {
   [ -n "$root_volume" ] || fail "Could not identify the imported root volume"
   qm set "$vmid" \
     --scsi0 "${root_volume},ssd=1,discard=on,iothread=1"
+
+  # ROOT_DISK_SIZE is in GiB, matching the APPDATA_DISK_SIZE convention above.
+  qm resize "$vmid" scsi0 "${ROOT_DISK_SIZE}G"
 
   if [ "$needs_appdata" -eq 1 ]; then
     qm set "$vmid" \

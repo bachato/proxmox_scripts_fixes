@@ -28,6 +28,15 @@ PROXMOX_SCALAR_USER_WARNING = (
     "to be removed in 27.2. Use 'users' list instead."
 )
 FULL_VALIDATION = False
+# Written once by the first-boot bootstrap sequence, then the template powers
+# off. The only on-disk log destination the syslog profiles are allowed to keep.
+BOOTSTRAP_REPORT_DIR = "/home/admin/logs"
+RAM_LOGGING_PATHS = (
+    "/etc/systemd/system/var-log.mount",
+    "/etc/systemd/system/rsyslog.service.d/10-runtime-dir.conf",
+    "/etc/tmpfiles.d/60-ram-logging.conf",
+    "/etc/fail2ban/fail2ban.local",
+)
 
 
 class UniqueKeyLoader(yaml.SafeLoader):
@@ -640,12 +649,35 @@ def validate_rsyslog(files: dict[str, str], profile_name: str) -> None:
             f'port="{SITE["SYSLOG_PORT"]}"',
             'protocol="tcp"',
             'TCP_Framing="traditional"',
-            'queue.filename="syslog-forward"',
-            'queue.maxDiskSpace="256m"',
+            'StateFile="/run/rsyslog/imjournal.state"',
+            'Ratelimit.Interval="60"',
+            'Ratelimit.Burst="25000"',
+            'queue.saveOnShutdown="off"',
+            'queue.timeoutEnqueue="0"',
             "\nstop\n",
         ),
         profile_name,
     )
+    # Scan directives only. Comments explain what is deliberately absent, so
+    # matching them would flag the explanation instead of a real setting.
+    directives = "\n".join(
+        line
+        for line in config.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    # Naming a queue file is what makes the queue disk-assisted, and overriding
+    # workDirectory from an included file reaches the whole daemon.
+    forbidden_disk = (
+        "queue.filename",
+        "queue.maxDiskSpace",
+        "workDirectory",
+        "/var/spool/",
+    )
+    present_disk = [fragment for fragment in forbidden_disk if fragment in directives]
+    if present_disk:
+        raise SystemExit(
+            f"{profile_name}: syslog forwarding spools to disk: {present_disk}"
+        )
     forbidden_tls = (
         "DefaultNetstreamDriverCAFile",
         "StreamDriver",
@@ -653,7 +685,7 @@ def validate_rsyslog(files: dict[str, str], profile_name: str) -> None:
         "ossl",
         "gtls",
     )
-    present_tls = [fragment for fragment in forbidden_tls if fragment in config]
+    present_tls = [fragment for fragment in forbidden_tls if fragment in directives]
     if present_tls:
         raise SystemExit(
             f"{profile_name}: plain TCP syslog contains TLS settings: {present_tls}"
@@ -666,6 +698,75 @@ def validate_rsyslog(files: dict[str, str], profile_name: str) -> None:
         run(
             ["/usr/sbin/rsyslogd", "-N1", "-f", "/dev/stdin"],
             input_text=config,
+        )
+
+
+def validate_ram_logging(files: dict[str, str], profile_name: str) -> None:
+    """Syslog profiles keep every log in RAM; the collector is the durable copy."""
+    validate_systemd_unit(
+        files["/etc/systemd/system/var-log.mount"],
+        f"{profile_name}:var-log.mount",
+        required={
+            "Mount": {
+                "What=tmpfs",
+                "Where=/var/log",
+                "Type=tmpfs",
+                "Options=mode=0755,nosuid,nodev,noexec,size=128M",
+            },
+            "Install": {"WantedBy=local-fs.target"},
+        },
+    )
+    # rsyslog is socket-activated, so systemd-tmpfiles ordering cannot be relied
+    # on to have created /run/rsyslog before imjournal opens its state file.
+    validate_systemd_unit(
+        files["/etc/systemd/system/rsyslog.service.d/10-runtime-dir.conf"],
+        f"{profile_name}:rsyslog runtime directory",
+        required={
+            "Service": {
+                "RuntimeDirectory=rsyslog",
+                "RuntimeDirectoryPreserve=yes",
+            }
+        },
+    )
+
+    journald = files["/etc/systemd/journald.conf.d/60-remote-syslog.conf"]
+    require_fragments(
+        journald,
+        ("Storage=volatile", "RuntimeMaxUse=64M"),
+        f"{profile_name}:journald",
+    )
+
+    fail2ban = files["/etc/fail2ban/fail2ban.local"]
+    require_fragments(fail2ban, ("logtarget = SYSTEMD-JOURNAL",), profile_name)
+    for line in fail2ban.splitlines():
+        if line.startswith("dbfile") and not line.split("=", 1)[1].strip().startswith(
+            "/run/"
+        ):
+            raise SystemExit(f"{profile_name}: fail2ban ban database is not in /run")
+
+    # Paths under /var/log are on the tmpfs, so they are RAM. What is still disk
+    # is /var/spool, and /var/log/journal would make the journal persistent again
+    # by giving Storage= somewhere to land if it ever drifts off volatile.
+    for path, content in files.items():
+        if path.startswith("/var/spool/"):
+            raise SystemExit(f"{profile_name}: {path} writes to the disk spool")
+        directives = "\n".join(
+            line
+            for line in content.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        for disk_path in re.findall(r"/var/(?:spool|log/journal)[A-Za-z0-9_./-]*", directives):
+            raise SystemExit(
+                f"{profile_name}: {path} names an on-disk log destination {disk_path}"
+            )
+
+    # The first-boot bootstrap report is the one sanctioned on-disk destination.
+    # Widening this allowance is what would quietly undo RAM-only logging, so it
+    # is named here rather than left implicit.
+    report = files["/usr/local/sbin/cloud-init-report"]
+    if BOOTSTRAP_REPORT_DIR not in report:
+        raise SystemExit(
+            f"{profile_name}: bootstrap report no longer writes {BOOTSTRAP_REPORT_DIR}"
         )
 
 
@@ -698,7 +799,7 @@ def validate_readme() -> None:
         "## Install Step #1: Create the cloud-init templates",
         "## Install Step #2: add template on Proxmox",
         "## To Do List",
-        "## How is AI used in this repo?",
+        "## How do I use AI?",
     )
     actual_headings = tuple(re.findall(r"(?m)^## .+$", content))
     if actual_headings != expected_headings:
@@ -770,8 +871,8 @@ def validate_readme() -> None:
         ),
         "proxmox-create-command.sh.tmpl",
     )
-    if "qm resize" in command_template:
-        raise SystemExit("template creation script must not resize the root disk")
+    if 'qm resize "$vmid" scsi0 "${ROOT_DISK_SIZE}G"' not in command_template:
+        raise SystemExit("template creation script must resize the root disk to ROOT_DISK_SIZE")
 
     # Proxmox only emits the hostname in the user-data it generates itself, so
     # the identity options are required and a custom user= snippet is forbidden.
@@ -990,6 +1091,7 @@ def main() -> int:
 
         if profile.syslog:
             validate_rsyslog(files, profile.output)
+            validate_ram_logging(files, profile.output)
             if "rsyslog-openssl" in config.get("packages", []):
                 raise SystemExit(
                     f"{profile.output}: plain TCP syslog must not install TLS support"
@@ -998,17 +1100,38 @@ def main() -> int:
             require_fragments(
                 finalizer,
                 (
-                    "install -d -m 0700 -o root -g root /var/spool/rsyslog",
+                    "systemctl enable var-log.mount",
+                    "systemctl is-enabled --quiet var-log.mount",
+                    "[ -e /run/rsyslog/imjournal.state ]",
                     "/usr/sbin/rsyslogd -N1",
                 ),
                 profile.output,
             )
+            if "/var/spool/rsyslog" in finalizer:
+                raise SystemExit(
+                    f"{profile.output}: finalizer still provisions the disk spool"
+                )
+            # Starting the mount mid-build would shadow the /var/log that
+            # cloud-init is still writing into and that the report script reads.
+            if "systemctl start var-log.mount" in finalizer or (
+                "systemctl enable --now var-log.mount" in finalizer
+            ):
+                raise SystemExit(
+                    f"{profile.output}: var-log.mount must be enabled, not started"
+                )
             if "update-ca-certificates" in finalizer:
                 raise SystemExit(
                     f"{profile.output}: plain TCP finalizer contains TLS setup"
                 )
-        elif any(path.startswith("/etc/rsyslog") for path in files):
-            raise SystemExit(f"{profile.output}: unexpected rsyslog configuration")
+        else:
+            if any(path.startswith("/etc/rsyslog") for path in files):
+                raise SystemExit(f"{profile.output}: unexpected rsyslog configuration")
+            for ram_only_path in RAM_LOGGING_PATHS:
+                if ram_only_path in files:
+                    raise SystemExit(
+                        f"{profile.output}: RAM-only logging is scoped to the "
+                        f"syslog profiles, but {ram_only_path} is present"
+                    )
 
     validate_readme()
     print("All cloud-init profiles validated")

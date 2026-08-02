@@ -323,12 +323,81 @@ write_files:
       RateLimitIntervalSec=30s
       RateLimitBurst=5000
 
+  # The collector is the only durable copy of this VM's logs, so /var/log is a
+  # tmpfs. It catches every writer the settings below do not name individually,
+  # including any package added later. The finalizer enables this unit but does
+  # not start it: the build boot still needs the real /var/log that cloud-init is
+  # writing into. Clones mount it from local-fs.target, before cloud-init runs.
+  - path: /etc/systemd/system/var-log.mount
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Volatile /var/log (tmpfs)
+
+      [Mount]
+      What=tmpfs
+      Where=/var/log
+      Type=tmpfs
+      Options=mode=0755,nosuid,nodev,noexec,size=128M
+
+      [Install]
+      WantedBy=local-fs.target
+
+  # systemd's own var.conf and systemd.conf already recreate /var/log and
+  # /var/log/private on the empty tmpfs. Nothing recreates /var/log/journal,
+  # which is what keeps the journal in /run/log/journal.
+  - path: /etc/tmpfiles.d/60-ram-logging.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      d /var/log/apt 0755 root root -
+      d /var/log/unattended-upgrades 0755 root root -
+      f /var/log/wtmp 0664 root utmp -
+      f /var/log/btmp 0660 root utmp -
+
+  # imjournal needs /run/rsyslog to exist before rsyslog starts, and rsyslog is
+  # socket-activated through syslog.socket, so start ordering cannot be assumed.
+  # RuntimeDirectory creates it immediately before every start regardless of the
+  # trigger; Preserve keeps the journal cursor across a service restart, without
+  # which rsyslog would re-forward the whole journal to the collector.
+  - path: /etc/systemd/system/rsyslog.service.d/10-runtime-dir.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Service]
+      RuntimeDirectory=rsyslog
+      RuntimeDirectoryMode=0700
+      RuntimeDirectoryPreserve=yes
+
+  # fail2ban logs to a file and keeps its ban database under /var by default.
+  # SYSTEMD-JOURNAL also gets its output forwarded to the collector, which the
+  # tmpfs alone would not do.
+  - path: /etc/fail2ban/fail2ban.local
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Definition]
+      logtarget = SYSTEMD-JOURNAL
+      dbfile = /run/fail2ban/fail2ban.sqlite3
+
   # The receiver is rendered from the tracked site configuration.
   - path: /etc/rsyslog.d/01-remote.conf
     owner: root:root
     permissions: "0644"
     content: |
-      module(load="imjournal" StateFile="imjournal.state")
+      # An absolute StateFile keeps the cursor out of Debian's $WorkDirectory,
+      # which is /var/spool/rsyslog. Overriding workDirectory globally from an
+      # included file would reach the whole daemon and degrade silently when the
+      # target is missing at startup, so leave it alone instead.
+      # Keep protection against journal replay loops and runaway producers, but
+      # use an explicit one-minute window suitable for container log bursts.
+      module(
+        load="imjournal"
+        StateFile="/run/rsyslog/imjournal.state"
+        Ratelimit.Interval="60"
+        Ratelimit.Burst="25000"
+      )
 
       action(
         type="omfwd"
@@ -339,14 +408,16 @@ write_files:
         template="RSYSLOG_SyslogProtocol23Format"
         action.resumeRetryCount="-1"
         action.resumeInterval="30"
+        # No queue.filename: naming a file is what makes a queue disk-assisted.
+        # RAM is the only buffer, so an unreachable collector drops messages
+        # rather than spooling them, lowest severity first.
         queue.type="LinkedList"
-        queue.filename="syslog-forward"
-        queue.size="10000"
-        queue.highWatermark="8000"
-        queue.lowWatermark="2000"
-        queue.maxDiskSpace="256m"
-        queue.saveOnShutdown="on"
-        queue.discardMark="9500"
+        queue.size="25000"
+        queue.highWatermark="20000"
+        queue.lowWatermark="5000"
+        queue.timeoutEnqueue="0"
+        queue.saveOnShutdown="off"
+        queue.discardMark="24000"
         queue.discardSeverity="7"
       )
 
@@ -655,12 +726,18 @@ write_files:
       sed -i -E \
         's/^[[:space:]]*module\(load="imuxsock".*$/# disabled: using imjournal/; s/^[[:space:]]*module\(load="imklog".*$/# disabled: using imjournal/' \
         /etc/rsyslog.conf
-      install -d -m 0700 -o root -g root /var/spool/rsyslog
+      systemd-analyze verify /etc/systemd/system/var-log.mount
+      systemctl enable var-log.mount
+      systemctl is-enabled --quiet var-log.mount
+
       systemctl restart systemd-journald.service
       /usr/sbin/rsyslogd -N1
       systemctl enable --now rsyslog.service
       systemctl restart rsyslog.service
       systemctl is-active --quiet rsyslog.service
+      # Catch a broken StateFile path or a missing runtime directory here rather
+      # than in production, where it would silently replay the journal.
+      [ -e /run/rsyslog/imjournal.state ]
       logger -t cloud-init "remote syslog forwarding smoke test"
 #% endif
 

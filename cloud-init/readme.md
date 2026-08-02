@@ -18,6 +18,10 @@ SSH login, and installs security updates and the QEMU guest agent.
 Docker variants add a dedicated APPDATA disk.
 Syslog variants send logs over unencrypted TCP, so use them only on a trusted or separately protected network.  (TLS in the future)
 
+Syslog variants also keep logging entirely in RAM: `/var/log` is a tmpfs, the
+journal is volatile, and the forwarding queue is memory-only. Your collector is
+the only durable copy. See "RAM-only logging" below for the tradeoffs.
+
 ## What's inside the templates
 
 ### Packages
@@ -49,13 +53,40 @@ configured.
 | Time | Timezone `America/Chicago` | cloud-init `timezone` |
 | APPDATA (Docker) | Disk checked by WWN and serial, ext4 labelled `APPDATA`, mounted at `/mnt/appdata`; Docker will not start without it | `appdata-verify.service` |
 | Docker | `data-root` on `/mnt/appdata/docker`, journald log driver, live restore, `admin` in the `docker` group | `/etc/docker/daemon.json` |
-| Syslog | Volatile journal (64M), forwarded to `SYSLOG_SERVER:SYSLOG_PORT` over plain TCP with a disk-backed queue and no local `/var/log` copy | `/etc/rsyslog.d/01-remote.conf` |
+| Syslog | Volatile journal (64M), read at up to 25,000 messages per 60 seconds, and forwarded to `SYSLOG_SERVER:SYSLOG_PORT` over plain TCP with a memory-only queue and no local `/var/log` copy | `/etc/rsyslog.d/01-remote.conf` |
+| RAM-only logging (syslog) | `/var/log` on a 128M tmpfs, fail2ban logging to the journal with its ban database in `/run` | `var-log.mount`, `/etc/fail2ban/fail2ban.local` |
 | First boot | Self-checks the whole bootstrap, writes logs to `/home/admin/logs/`, then powers off; a failed boot stays running | `cloud-init-post-verify.service` |
 
 Site-specific values such as `SYSLOG_SERVER`, `SYSLOG_PORT`,
 `FAIL2BAN_IGNORE_IPS`, `APPDATA_WWN`, and `APPDATA_SERIAL` come from
 `tools/.env`. `templates/deb_13.yml.tmpl` is the authority if this summary ever
 falls behind.
+
+### RAM-only logging (syslog variants)
+
+A VM cloned from a syslog template never writes a log to its disk. `/var/log` is
+a tmpfs mounted from `local-fs.target`, before cloud-init runs, so even
+cloud-init's own log lands in RAM. The journal is volatile, the rsyslog
+forwarding queue has no disk spool, and fail2ban logs to the journal instead of
+a file. Nothing swaps to disk either: the only swap device is zram.
+
+What you give up:
+
+- **An unreachable collector loses messages.** The queue holds roughly 25,000
+  messages in RAM and then discards, lowest severity first, rather than spooling
+  to disk. There is no catch-up after a long outage.
+- **A sustained log storm is rate-limited.** imjournal accepts 25,000 messages
+  per 60-second window and reports excess messages as discarded.
+- **Reboots lose all local history.** There is nothing to read after the fact
+  except what the collector already received.
+- **fail2ban forgets its bans on reboot.** The ban database lives in `/run`.
+  Bans do survive a fail2ban restart.
+
+Two things stay on disk on purpose. `/home/admin/logs/` is written once by the
+first-boot bootstrap report and is how you debug a failed first boot. And the
+template build boot itself writes `/var/log` normally, before the mount is
+enabled — those files stay in the template image, shadowed and unused on every
+clone.
 
 ## Basic logic of the repo
 
@@ -156,6 +187,10 @@ stays running so it can be inspected from the Proxmox console.
   failure mode.
 - Rootless Docker
 
-## How is AI used in this repo?
+## How do I use AI?
 
-I use AI as a tool and a search engine, not a replacement.  I do not add code or features that I do not understand, or have not reviewed.
+AI is not a substitute for understanding the code. I do not include code or features that I cannot explain, review, and maintain.
+
+I use AI as a research and development assistant.  AI helps me explore ideas, reviews code, tests code in my own local virtual environments, and at times also generates code for me.
+
+AI-assisted contributions are subject to the same validation process as my other contributions, including testing, manual review, and verification against relevant documentation and requirements. I remain responsible for all code committed to this repository.
