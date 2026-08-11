@@ -1,7 +1,8 @@
 # Debian 13 cloud-init templates for Proxmox
 
-## NOTE: This is the last update to this repo for cloud-init.  This project will from now on be maintained at the repo below,  
-where I'm able to deploy many more resources towards testing and development:
+## NOTE: This is the last update to this repo for cloud-init.  This project will from now on be maintained at the repo below, where I'm able to deploy many more resources towards testing and development:
+
+
 https://github.com/kasa-consulting/kasa-cloud-init-public
 
 ## What this repo does
